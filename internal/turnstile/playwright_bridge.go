@@ -34,7 +34,10 @@ func NewPlaywrightBridge(proxy string, cm *clearance.Manager) *PlaywrightBridge 
 		Python:     findPython(),
 		Proxy:      proxy,
 		Clear:      cm,
-		Timeout:    100 * time.Second,
+		// 45s 上限基于实测：成功 mint 耗时 15.8~27.5s（12/12，p90=21.8s），
+		// 留近 2x 余量；超时多为 CF iframes=0 不出 token，等再久也拿不到，
+		// 失败快速重试比傻等 90s 更省空转。
+		Timeout:    45 * time.Second,
 	}
 }
 

@@ -40,7 +40,7 @@ func NewBrowser(proxy string, cm *clearance.Manager) *Browser {
 		ExecPath:      browser.FindChrome(),
 		Proxy:         proxy,
 		Clear:         cm,
-		HardTimeout:   90 * time.Second,
+		HardTimeout:   45 * time.Second, // 与 Playwright mint 对齐（实测成功 15.8~27.5s，45s 足够且留余量）
 		InitialWait:   500 * time.Millisecond, // match Python SOLVER_INITIAL_WAIT_MS default
 		PollInterval:  500 * time.Millisecond,
 		PollAttempts:  100,
