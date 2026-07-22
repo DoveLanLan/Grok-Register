@@ -18,6 +18,44 @@ import glob
 import os
 import sys
 import time
+from urllib.parse import unquote, urlsplit, urlunsplit
+
+
+def playwright_proxy(raw: str) -> dict[str, str]:
+    """Convert a proxy URL into Playwright's proxy configuration.
+
+    Playwright expects proxy credentials in separate username/password fields.
+    Passing userinfo inside ``server`` makes Chromium reject authenticated
+    proxies with ERR_INVALID_AUTH_CREDENTIALS.
+    """
+    value = (raw or "").strip()
+    config = {"server": value}
+    if not value:
+        return config
+
+    try:
+        parsed = urlsplit(value)
+        if not parsed.scheme or not parsed.hostname:
+            return config
+        if parsed.username is None and parsed.password is None:
+            return config
+
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        config["server"] = urlunsplit(
+            (parsed.scheme, host, parsed.path, parsed.query, "")
+        )
+        if parsed.username is not None:
+            config["username"] = unquote(parsed.username)
+        if parsed.password is not None:
+            config["password"] = unquote(parsed.password)
+    except ValueError:
+        # Let Playwright report malformed proxy URLs consistently.
+        return {"server": value}
+    return config
 
 
 def find_chrome() -> str:
@@ -101,8 +139,7 @@ async def mint(
         ],
     }
     if proxy:
-        # Playwright accepts {"server": "http://..."}
-        launch["proxy"] = {"server": proxy}
+        launch["proxy"] = playwright_proxy(proxy)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**launch)
