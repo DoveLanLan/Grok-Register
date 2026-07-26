@@ -133,6 +133,28 @@ func (inv *Inventory[T, Q]) ClaimPair(ctx context.Context) (*Pair[T, Q], error) 
 	}
 }
 
+// ClaimQ waits for a single Q item without requiring a paired T.
+// Used by browser signup, which mints its own Turnstile/Castle tokens.
+func (inv *Inventory[T, Q]) ClaimQ(ctx context.Context) (*Envelope[Q], error) {
+	for {
+		inv.mu.Lock()
+		inv.purgeLocked()
+		if len(inv.qs) > 0 {
+			q := inv.qs[0]
+			inv.qs = inv.qs[1:]
+			inv.mu.Unlock()
+			return q, nil
+		}
+		inv.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-inv.waitCh:
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func (inv *Inventory[T, Q]) Depths() (t, q int) {
 	inv.mu.Lock()
 	defer inv.mu.Unlock()
