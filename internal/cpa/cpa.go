@@ -2,6 +2,7 @@ package cpa
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,13 +24,14 @@ const (
 )
 
 var CliproxyHeaders = map[string]string{
-	"x-grok-client-version":    "0.2.93",
+	"x-grok-client-version":    oauth.ClientVersion,
 	"x-xai-token-auth":         "xai-grok-cli",
 	"X-XAI-Token-Auth":         "xai-grok-cli",
 	"x-authenticateresponse":   "authenticate-response",
 	"x-grok-client-identifier": "grok-shell",
+	"x-grok-client-mode":       "headless",
 	"x-compaction-at":          "400000",
-	"User-Agent":               "grok-shell/0.2.93 (linux; x86_64)",
+	"User-Agent":               "grok-shell/" + oauth.ClientVersion + " (linux; x86_64)",
 }
 
 // Document is CPA-ready JSON.
@@ -107,18 +110,38 @@ func WriteAtomic(dir string, doc Document, secret []byte) (string, error) {
 // Probe hits cli-chat-proxy with minimal responses call (acpa_watchdog shape).
 // New tokens often get transient 403 permission-denied; warmup + short retries.
 // Returns nil if alive.
-func Probe(doc Document, proxy string) error {
-	_ = proxy
+func Probe(doc Document, proxy string, warmupSec ...float64) error {
+	return ProbeContext(context.Background(), doc, proxy, warmupSec...)
+}
+
+// ProbeContext is Probe with cancellation for pipeline shutdown.
+func ProbeContext(ctx context.Context, doc Document, proxy string, warmupSec ...float64) error {
+	client, err := newProbeClient(proxy)
+	if err != nil {
+		return err
+	}
+	defer client.CloseIdleConnections()
+
 	// Warmup: mint-then-immediate chat often 403s.
-	time.Sleep(3 * time.Second)
+	warmup := 3.0
+	if len(warmupSec) > 0 {
+		warmup = warmupSec[0]
+	}
+	if warmup > 0 {
+		if err := waitForContext(ctx, time.Duration(warmup*float64(time.Second))); err != nil {
+			return err
+		}
+	}
 
 	var last error
 	// Immediate 403 retries (default 2 sleeps of 4s like ACPA_403_IMMEDIATE_*)
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(4 * time.Second)
+			if err := waitForContext(ctx, 4*time.Second); err != nil {
+				return err
+			}
 		}
-		err := probeOnce(doc)
+		err := probeOnce(ctx, client, doc)
 		if err == nil {
 			return nil
 		}
@@ -134,8 +157,37 @@ func Probe(doc Document, proxy string) error {
 	return last
 }
 
-func probeOnce(doc Document) error {
-	client := &http.Client{Timeout: 45 * time.Second}
+func waitForContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func newProbeClient(proxy string) (*http.Client, error) {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("probe transport unavailable")
+	}
+	transport := base.Clone()
+	// OAuth treats an empty account proxy as direct, so probing must not silently
+	// inherit HTTP_PROXY/HTTPS_PROXY and change the account's egress.
+	transport.Proxy = nil
+	if raw := strings.TrimSpace(proxy); raw != "" {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return nil, fmt.Errorf("probe proxy invalid")
+		}
+		transport.Proxy = http.ProxyURL(parsed)
+	}
+	return &http.Client{Timeout: 45 * time.Second, Transport: transport}, nil
+}
+
+func probeOnce(ctx context.Context, client *http.Client, doc Document) error {
 	// Match keys/acpa_watchdog.py body exactly — bare content string can 403.
 	payload := map[string]any{
 		"model":             "grok-4.5",
@@ -161,7 +213,7 @@ func probeOnce(doc Document) error {
 	if strings.HasSuffix(base, "/responses") {
 		url = base
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -237,6 +289,30 @@ func AppendAuthSession(path, email, sso string) error {
 		"cookies": []map[string]string{
 			{"name": "sso", "value": sso, "domain": ".x.ai", "path": "/"},
 		},
+	}
+	raw, _ := json.Marshal(doc)
+	_, err = f.Write(append(raw, '\n'))
+	return err
+}
+
+// AppendOAuthFailure records only the account key and safe error text. The SSO
+// remains in accounts.txt/auth-sessions.jsonl and is not duplicated here.
+func AppendOAuthFailure(path, email, reason string, diagnosticID ...string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	doc := map[string]string{
+		"email":     email,
+		"error":     reason,
+		"failed_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(diagnosticID) > 0 && strings.TrimSpace(diagnosticID[0]) != "" {
+		doc["diagnostic_id"] = strings.TrimSpace(diagnosticID[0])
 	}
 	raw, _ := json.Marshal(doc)
 	_, err = f.Write(append(raw, '\n'))

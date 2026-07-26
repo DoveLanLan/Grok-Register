@@ -1,7 +1,9 @@
 package cpa
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -14,12 +16,12 @@ import (
 
 func TestNormalizeManagementBase(t *testing.T) {
 	cases := map[string]string{
-		"http://cli-proxy-api:8317":                    "http://127.0.0.1:8317/v0/management",
-		"http://cli-proxy-api:8317/":                   "http://127.0.0.1:8317/v0/management",
-		"http://cli-proxy-api:8317/v0/management":      "http://127.0.0.1:8317/v0/management",
-		"http://127.0.0.1:8317":                        "http://127.0.0.1:8317/v0/management",
-		"http://127.0.0.1:8317/v0/management":          "http://127.0.0.1:8317/v0/management",
-		"http://localhost:8317/v0/management":          "http://localhost:8317/v0/management",
+		"http://cli-proxy-api:8317":               "http://127.0.0.1:8317/v0/management",
+		"http://cli-proxy-api:8317/":              "http://127.0.0.1:8317/v0/management",
+		"http://cli-proxy-api:8317/v0/management": "http://127.0.0.1:8317/v0/management",
+		"http://127.0.0.1:8317":                   "http://127.0.0.1:8317/v0/management",
+		"http://127.0.0.1:8317/v0/management":     "http://127.0.0.1:8317/v0/management",
+		"http://localhost:8317/v0/management":     "http://localhost:8317/v0/management",
 	}
 	for in, want := range cases {
 		got := NormalizeManagementBase(in)
@@ -160,6 +162,31 @@ func TestUploadJSONRaw(t *testing.T) {
 	}
 	if !strings.Contains(gotQuery, "name=acc.json") {
 		t.Fatalf("query=%s", gotQuery)
+	}
+}
+
+func TestUploadDocumentContextHonorsCancellation(t *testing.T) {
+	uploader := NewUploader(UploadConfig{
+		Enabled: true,
+		BaseURL: "http://127.0.0.1:1",
+		Key:     "key",
+	}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result := uploader.UploadDocumentContext(ctx, Document{Email: "person@example.com"})
+	if !errors.Is(result.Err, context.Canceled) {
+		t.Fatalf("upload error = %v, want context canceled", result.Err)
+	}
+}
+
+func TestUploaderTransportRemainsDirect(t *testing.T) {
+	uploader := NewUploader(UploadConfig{}, nil)
+	transport, ok := uploader.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("uploader transport = %T", uploader.client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("CPA management uploader must not inherit account or environment proxies")
 	}
 }
 

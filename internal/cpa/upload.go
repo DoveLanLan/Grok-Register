@@ -2,6 +2,7 @@ package cpa
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -200,16 +201,26 @@ func (u *Uploader) UploadFile(path string) UploadResult {
 
 // UploadDocument marshals doc and uploads.
 func (u *Uploader) UploadDocument(doc Document) UploadResult {
+	return u.UploadDocumentContext(context.Background(), doc)
+}
+
+// UploadDocumentContext is UploadDocument with cancellation support.
+func (u *Uploader) UploadDocumentContext(ctx context.Context, doc Document) UploadResult {
 	name := UploadName(doc, u.cfg.NameTemplate)
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return UploadResult{Name: name, Err: err}
 	}
-	return u.UploadBytes(name, raw)
+	return u.UploadBytesContext(ctx, name, raw)
 }
 
 // UploadBytes uploads raw JSON with given filename (must end with .json).
 func (u *Uploader) UploadBytes(name string, raw []byte) UploadResult {
+	return u.UploadBytesContext(context.Background(), name, raw)
+}
+
+// UploadBytesContext is UploadBytes with cancellation support.
+func (u *Uploader) UploadBytesContext(ctx context.Context, name string, raw []byte) UploadResult {
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		name += ".json"
 	}
@@ -224,9 +235,18 @@ func (u *Uploader) UploadBytes(name string, raw []byte) UploadResult {
 	}
 	var last UploadResult
 	for attempt := 0; attempt <= retries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return UploadResult{Name: name, Err: err}
+		}
 		if attempt > 0 {
 			backoff := time.Duration(attempt*attempt) * 400 * time.Millisecond
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return UploadResult{Name: name, Err: ctx.Err()}
+			case <-timer.C:
+			}
 		}
 		mode := strings.ToLower(strings.TrimSpace(u.cfg.Mode))
 		if mode == "" {
@@ -234,12 +254,12 @@ func (u *Uploader) UploadBytes(name string, raw []byte) UploadResult {
 		}
 		var r UploadResult
 		if mode == "json" || mode == "raw" {
-			r = u.doJSON(name, raw)
+			r = u.doJSON(ctx, name, raw)
 		} else {
-			r = u.doMultipart(name, raw)
+			r = u.doMultipart(ctx, name, raw)
 			// fallback to raw json once if multipart fails with 4xx (except 401/403)
 			if !r.OK && r.Status >= 400 && r.Status < 500 && r.Status != 401 && r.Status != 403 {
-				r2 := u.doJSON(name, raw)
+				r2 := u.doJSON(ctx, name, raw)
 				if r2.OK {
 					r = r2
 				}
@@ -248,7 +268,7 @@ func (u *Uploader) UploadBytes(name string, raw []byte) UploadResult {
 		last = r
 		if r.OK {
 			if u.cfg.Verify {
-				ok, err := u.verifyListed(name)
+				ok, err := u.verifyListed(ctx, name)
 				last.Verified = ok
 				if err != nil {
 					u.logf("[cpa] verify list failed %s: %v", name, err)
@@ -278,7 +298,7 @@ func (u *Uploader) endpoint() string {
 	return strings.TrimRight(u.cfg.BaseURL, "/") + "/auth-files"
 }
 
-func (u *Uploader) doMultipart(name string, raw []byte) UploadResult {
+func (u *Uploader) doMultipart(ctx context.Context, name string, raw []byte) UploadResult {
 	res := UploadResult{Name: name}
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
@@ -292,7 +312,7 @@ func (u *Uploader) doMultipart(name string, raw []byte) UploadResult {
 		return res
 	}
 	_ = w.Close()
-	req, err := http.NewRequest(http.MethodPost, u.endpoint(), &body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.endpoint(), &body)
 	if err != nil {
 		res.Err = err
 		return res
@@ -302,10 +322,10 @@ func (u *Uploader) doMultipart(name string, raw []byte) UploadResult {
 	return u.do(req, res)
 }
 
-func (u *Uploader) doJSON(name string, raw []byte) UploadResult {
+func (u *Uploader) doJSON(ctx context.Context, name string, raw []byte) UploadResult {
 	res := UploadResult{Name: name}
 	ep := u.endpoint() + "?name=" + url.QueryEscape(name)
-	req, err := http.NewRequest(http.MethodPost, ep, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep, bytes.NewReader(raw))
 	if err != nil {
 		res.Err = err
 		return res
@@ -334,8 +354,8 @@ func (u *Uploader) do(req *http.Request, res UploadResult) UploadResult {
 	return res
 }
 
-func (u *Uploader) verifyListed(name string) (bool, error) {
-	req, err := http.NewRequest(http.MethodGet, u.endpoint(), nil)
+func (u *Uploader) verifyListed(ctx context.Context, name string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.endpoint(), nil)
 	if err != nil {
 		return false, err
 	}
