@@ -3,6 +3,8 @@ bin/
 *.exe
 *.test
 *.out
+# `make build` drops the CLI at the repo root
+/grok
 
 # OS
 .DS_Store
