@@ -16,11 +16,11 @@ import (
 )
 
 var bannedDomains = map[string]struct{}{
-	"duckmail.sbs":     {},
-	"web-library.net":  {},
-	"mail.tm":          {},
-	"mail.gw":          {},
-	"baldur.edu.kg":    {},
+	"duckmail.sbs":    {},
+	"web-library.net": {},
+	"mail.tm":         {},
+	"mail.gw":         {},
+	"baldur.edu.kg":   {},
 }
 
 var codeRe = []*regexp.Regexp{
@@ -30,11 +30,12 @@ var codeRe = []*regexp.Regexp{
 }
 
 type Handle struct {
-	Kind     string // lol | mt | custom
-	Email    string
-	Password string
-	Token    string
-	Base     string // mail.tm base
+	Kind      string // lol | mt | custom | cftemp
+	Email     string
+	Password  string
+	Token     string
+	Base      string // mail.tm base or cloudflare_temp_email Worker root
+	AddressID int64
 }
 
 type Provider struct {
@@ -42,6 +43,10 @@ type Provider struct {
 	mu  sync.Mutex
 	// lol rate limit
 	lolNextOK time.Time
+	// cfTempDomains is the rotation pool built from CFTempDomain; benched
+	// entries are skipped until the pool would otherwise be empty.
+	cfTempDomains []string
+	cfTempBenched map[string]struct{}
 }
 
 type Config struct {
@@ -50,6 +55,11 @@ type Config struct {
 	API           string
 	LOLRetries    int
 	LOLIntervalMS int
+	CFTempAPI     string
+	CFTempAdmin   string
+	CFTempDomain  string
+	CFTempAuth    string
+	CFTempPrefix  bool
 	HTTPClient    *http.Client
 }
 
@@ -63,7 +73,83 @@ func New(cfg Config) *Provider {
 	if cfg.LOLIntervalMS <= 0 {
 		cfg.LOLIntervalMS = 400
 	}
-	return &Provider{cfg: cfg}
+	return &Provider{
+		cfg:           cfg,
+		cfTempDomains: SplitDomains(cfg.CFTempDomain),
+		cfTempBenched: map[string]struct{}{},
+	}
+}
+
+// SplitDomains parses a comma/whitespace separated mailbox domain list.
+//
+// x.ai's trust in a mailbox domain decays with the number of accounts it has
+// seen, so a run should spread across every domain the Worker serves instead of
+// hammering one. A single value stays a single-entry pool.
+func SplitDomains(raw string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, field := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	}) {
+		domain := strings.ToLower(strings.TrimSpace(field))
+		if domain == "" || domainBanned(domain) {
+			continue
+		}
+		if _, dup := seen[domain]; dup {
+			continue
+		}
+		seen[domain] = struct{}{}
+		out = append(out, domain)
+	}
+	return out
+}
+
+// CFTempDomainPool reports the domains still in rotation (benched ones excluded).
+func (p *Provider) CFTempDomainPool() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.liveDomainsLocked()
+}
+
+func (p *Provider) liveDomainsLocked() []string {
+	var live []string
+	for _, candidate := range p.cfTempDomains {
+		if _, benched := p.cfTempBenched[candidate]; !benched {
+			live = append(live, candidate)
+		}
+	}
+	return live
+}
+
+// BenchDomain removes a mailbox domain from the rotation after x.ai starts
+// rejecting its accounts. The last live domain is never benched: an empty pool
+// would fall back to the Worker's default and silently undo the rotation.
+func (p *Provider) BenchDomain(domain string) bool {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, already := p.cfTempBenched[domain]; already {
+		return false
+	}
+	if len(p.liveDomainsLocked()) <= 1 {
+		return false
+	}
+	p.cfTempBenched[domain] = struct{}{}
+	return true
+}
+
+// nextCFTempDomain picks a random live domain from the pool.
+func (p *Provider) nextCFTempDomain() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	live := p.liveDomainsLocked()
+	if len(live) == 0 {
+		return ""
+	}
+	return live[rand.Intn(len(live))]
 }
 
 func randStr(n int) string {
@@ -77,9 +163,17 @@ func randStr(n int) string {
 
 func (p *Provider) Create() (Handle, error) {
 	password := randStr(15)
-	if p.cfg.Mode == config.EmailCustom {
+	switch p.cfg.Mode {
+	case config.EmailCustom:
 		email := fmt.Sprintf("oc%s@%s", randStr(10), p.cfg.Domain)
 		return Handle{Kind: "custom", Email: email, Password: password}, nil
+	case config.EmailCFTemp:
+		h, err := p.cfTempCreate()
+		if err != nil {
+			return Handle{}, err
+		}
+		h.Password = password
+		return h, nil
 	}
 	var last error
 	for i := 0; i < p.cfg.LOLRetries; i++ {
@@ -296,9 +390,212 @@ func (p *Provider) fetch(h Handle) (string, error) {
 		defer resp2.Body.Close()
 		b2, _ := io.ReadAll(io.LimitReader(resp2.Body, 2<<20))
 		return string(b2), nil
+	case "cftemp":
+		return p.cfTempFetch(h)
 	default:
 		return "", fmt.Errorf("unknown handle kind")
 	}
+}
+
+// cfTempCreate creates a mailbox through a self-hosted
+// dreamhunter2333/cloudflare_temp_email Worker. Admin creation is preferred
+// when configured; otherwise the public endpoint is used.
+func (p *Provider) cfTempCreate() (Handle, error) {
+	base := strings.TrimRight(strings.TrimSpace(p.cfg.CFTempAPI), "/")
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(p.cfg.API), "/")
+	}
+	if base == "" {
+		return Handle{}, fmt.Errorf("cf_temp_email: set CF_TEMP_EMAIL_API")
+	}
+	domain := p.nextCFTempDomain()
+	if domain == "" {
+		domain = strings.TrimSpace(p.cfg.Domain)
+	}
+	payload := map[string]any{
+		"name":         "oc" + randStr(10),
+		"enablePrefix": p.cfg.CFTempPrefix,
+	}
+	if domain != "" {
+		payload["domain"] = domain
+	}
+
+	admin := strings.TrimSpace(p.cfg.CFTempAdmin)
+	endpoint := base + "/api/new_address"
+	if admin != "" {
+		endpoint = base + "/admin/new_address"
+	} else {
+		// Current Worker frontends use these fields for public creation. An empty
+		// cf_token is accepted when Turnstile enforcement is disabled.
+		payload["cf_token"] = ""
+		payload["enableRandomSubdomain"] = false
+		if domain == "" {
+			if picked, err := p.cfTempPickDomain(base); err == nil && picked != "" {
+				payload["domain"] = picked
+			}
+		}
+	}
+	raw, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(raw)))
+	if err != nil {
+		return Handle{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if admin != "" {
+		req.Header.Set("x-admin-auth", admin)
+	}
+	if auth := strings.TrimSpace(p.cfg.CFTempAuth); auth != "" {
+		req.Header.Set("x-custom-auth", auth)
+	}
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return Handle{}, err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return Handle{}, fmt.Errorf("cf_temp_email create http=%d body=%s", resp.StatusCode, truncate(string(body), 120))
+	}
+	return cfTempParseCreate(body, base)
+}
+
+func (p *Provider) cfTempPickDomain(base string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, base+"/open_api/settings", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	if auth := strings.TrimSpace(p.cfg.CFTempAuth); auth != "" {
+		req.Header.Set("x-custom-auth", auth)
+	}
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("settings http=%d", resp.StatusCode)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", err
+	}
+	for _, key := range []string{"defaultDomains", "domains"} {
+		items, _ := data[key].([]any)
+		var domains []string
+		for _, item := range items {
+			if domain, ok := item.(string); ok && strings.TrimSpace(domain) != "" {
+				domains = append(domains, strings.TrimSpace(domain))
+			}
+		}
+		if len(domains) > 0 {
+			return domains[rand.Intn(len(domains))], nil
+		}
+	}
+	return "", fmt.Errorf("no domains in open_api/settings")
+}
+
+func cfTempParseCreate(body []byte, base string) (Handle, error) {
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return Handle{}, fmt.Errorf("cf_temp_email create response is not JSON")
+	}
+	address, _ := data["address"].(string)
+	token, _ := data["jwt"].(string)
+	if address == "" || token == "" {
+		return Handle{}, fmt.Errorf("cf_temp_email create response missing address or jwt")
+	}
+	var addressID int64
+	switch value := data["address_id"].(type) {
+	case float64:
+		addressID = int64(value)
+	case json.Number:
+		addressID, _ = value.Int64()
+	}
+	return Handle{
+		Kind:      "cftemp",
+		Email:     address,
+		Token:     token,
+		Base:      base,
+		AddressID: addressID,
+	}, nil
+}
+
+func (p *Provider) cfTempFetch(h Handle) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(h.Base), "/")
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(p.cfg.CFTempAPI), "/")
+	}
+	if base == "" || strings.TrimSpace(h.Token) == "" {
+		return "", fmt.Errorf("cf_temp_email not configured")
+	}
+	parsed, parsedErr := p.cfTempGet(base+"/api/parsed_mails?limit=10&offset=0", h.Token, true)
+	if parsedErr == nil && parsed != "" {
+		return parsed, nil
+	}
+	raw, rawErr := p.cfTempGet(base+"/api/mails?limit=10&offset=0", h.Token, false)
+	if rawErr != nil {
+		if parsedErr != nil {
+			return "", fmt.Errorf("cf_temp_email fetch: parsed=%v raw=%v", parsedErr, rawErr)
+		}
+		return "", rawErr
+	}
+	return raw, nil
+}
+
+func (p *Provider) cfTempGet(endpoint, token string, parsed bool) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	if auth := strings.TrimSpace(p.cfg.CFTempAuth); auth != "" {
+		req.Header.Set("x-custom-auth", auth)
+	}
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("http=%d body=%s", resp.StatusCode, truncate(string(body), 80))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		var items []any
+		if json.Unmarshal(body, &items) == nil {
+			return cfTempJoinMails(items, parsed), nil
+		}
+		return "", fmt.Errorf("cf_temp_email mail response is not JSON")
+	}
+	items, _ := data["results"].([]any)
+	if items == nil {
+		items, _ = data["mails"].([]any)
+	}
+	if items == nil {
+		return cfTempJoinMails([]any{data}, parsed), nil
+	}
+	return cfTempJoinMails(items, parsed), nil
+}
+
+func cfTempJoinMails(items []any, parsed bool) string {
+	var joined strings.Builder
+	for _, item := range items {
+		mail, _ := item.(map[string]any)
+		if mail == nil {
+			continue
+		}
+		if parsed {
+			fmt.Fprintf(&joined, "%v\n%v\n%v\n%v\n", mail["subject"], mail["text"], mail["html"], mail["sender"])
+		} else {
+			fmt.Fprintf(&joined, "%v\n%v\n%v\n%v\n%v\n", mail["subject"], mail["text"], mail["html"], mail["raw"], mail["source"])
+		}
+	}
+	return joined.String()
 }
 
 func extractCode(text string) string {
