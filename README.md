@@ -10,6 +10,7 @@ grok status
 grok logs -f
 grok stop
 grok upload    # 手动上传 CPA JSON 到 Management API
+grok test-email --email user@outlook.com  # 用真实邮箱做一次前台验证
 ```
 
 ---
@@ -22,6 +23,7 @@ grok upload    # 手动上传 CPA JSON 到 Management API
 - 可选探活；可选自动上传到 CPA Management API
 - 内置 Cloudflare 清障 compose（WARP + Privoxy + FlareSolverr）
 - Turnstile：默认 **Playwright + CloakBrowser**（与原 Python 注册机同路径），可选 lite farm
+- 可选 **browser-mcp**：操作当前真实 Chrome，以受控无痕窗口完成注册和同会话 OAuth
 
 ---
 
@@ -33,6 +35,7 @@ grok upload    # 手动上传 CPA JSON 到 Management API
 | Python 3.10+ + venv | Turnstile Playwright mint | 拿不到 token |
 | Playwright + CloakBrowser | 无头过 CF Turnstile | `timeout` / `iframes=0` |
 | CloakBrowser Chromium | 指纹相对稳的无头 Chrome | mint 失败率高 |
+| browser-mcp + Chrome 扩展（可选） | `REGISTER_MODE=browser-mcp` 真实浏览器注册 | 不能使用 browser-mcp 模式 |
 | Docker | 清障栈（强烈推荐） | 注册/邮箱/CF 更容易挂 |
 | CPA Management（可选） | `grok upload` / 自动上传 | 本地仍有 `CPA/*.json` |
 
@@ -192,11 +195,21 @@ CLEARANCE_PROXY=http://privoxy:8118
 CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai
 
 TURNSTILE_PROVIDER=browser
+REGISTER_MODE=browser
 
 PROTOCOL_HTTP=1
 HTTP_POOL_SIZE=8
 TEMPMAIL_LOL_RETRIES=30
 TEMPMAIL_LOL_MIN_INTERVAL_MS=1500
+
+OAUTH_WORKERS=1
+OAUTH_MIN_INTERVAL_SEC=15
+OAUTH_RETRY_SEC=60
+OAUTH_FLOW_RETRIES=0
+OAUTH_RETRY_DELAY_SEC=30
+OAUTH_INVALID_GRANT_LIMIT=1
+OAUTH_CONFIRM_MODE=browser
+OAUTH_BROWSER_TIMEOUT_SEC=150
 
 HTTPS_PROXY=http://127.0.0.1:40080
 HTTP_PROXY=http://127.0.0.1:40080
@@ -215,6 +228,32 @@ CPA_UPLOAD_RETRIES=2
 CPA_UPLOAD_NAME_TEMPLATE={email}.json
 EOF
 ```
+
+使用你本地开发的 browser-mcp 控制真实 Chrome：
+
+```bash
+cd /path/to/browser-mcp
+uv sync
+uv run browser-mcp-bridge
+```
+
+在 Chrome 加载 `browser-mcp/extension`，并在扩展详情中启用
+`Allow in Incognito`。然后把以下内容写入 `~/.grok/config.env`：
+
+```env
+REGISTER_MODE=browser-mcp
+BROWSER_MCP_CLI=/path/to/browser-mcp/.venv/bin/browser-mcp-cli
+BROWSER_MCP_INCOGNITO=1
+```
+
+另开终端运行：
+
+```bash
+grok mcp-register       # 前台注册一个
+# 或 grok start -t 10   # 后台按目标运行
+```
+
+browser-mcp 会轮询页面中的 Turnstile 响应长度、挑战可见状态和提交按钮状态；若 Cloudflare 要求人工点击，可直接在弹出的真实 Chrome 窗口完成。每个账号强制使用无痕窗口；开始注册前和关闭窗口前都会清除该无痕 Cookie store 中的 x.ai/Grok 登录 Cookie（不向 Go 返回 Cookie 值）。成功、失败或取消都会关闭账号标签页，下一账号不会继承上一个账号。
 
 自建邮箱（可选）：
 
@@ -290,6 +329,25 @@ sudo /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements-turnstile.tx
 | `grok logs -f` | 实时跟踪日志 |
 | `grok stop` | 立即停止 |
 | `grok upload` | 交互选择最近 10 次 run，上传其中 CPA JSON |
+| `grok test-email --email ADDRESS` | 前台用指定真实邮箱注册一次，手动输入验证码并测试 OAuth/CPA |
+| `grok mcp-register` | 强制使用 browser-mcp 真实 Chrome 前台注册一个账号 |
+
+---
+
+### 用 Outlook 等真实邮箱验证 OAuth
+
+`EMAIL_DOMAIN=outlook.com` 只会生成并不存在的随机地址，不能用于这个实验。请改用一个你能实际收信、且尚未注册过 x.ai 的邮箱：
+
+```bash
+grok test-email --email user@outlook.com
+# 收到 x.ai 邮件后，在当前终端输入验证码，例如 ABC-123
+```
+
+该命令不会索取 Outlook 密码，也不会自动读取邮箱。它使用独立的 `outputs/test-<时间>/` 目录，依次执行注册、CloakBrowser 完成 accounts.x.ai OAuth Device Flow 批准和 CPA 探活（`PROBE_ENABLED=0` 时跳过探活）；前台测试与后台 `grok start` 不能同时运行。
+
+- OAuth 成功并生成 `CPA/*.json`：邮箱类型/域名信誉是关键变量之一。
+- 注册成功但 OAuth 返回 `invalid_grant (Access denied)`：当前结果不支持“只是临时邮箱域名导致”的判断，应继续检查 x.ai 的新账号签发策略。
+- OAuth 成功但探活失败：token 已写入 `discarded/`，说明邮箱与 token 签发测试已通过，失败发生在 CPA API 权限或可用性阶段。
 
 ---
 
@@ -312,15 +370,22 @@ sudo /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements-turnstile.tx
 ## 流水线
 
 ```text
-清障预热 → S:Turnstile → P:邮箱+验证码 → C:注册拿 SSO
-       → 立刻 OAuth (HTTP device verify/approve)
+清障预热 → P:邮箱 → 浏览器页面发送/填写验证码
+       → CloakBrowser 或 browser-mcp 完成 Castle/Turnstile 与注册
+       → 同一浏览器会话完成 Device Flow 批准
+       → 关闭账号无痕窗口并销毁登录态
+       → auth.x.ai token endpoint 轮询 token
        → 整备 CPA JSON → 探活 → 写 CPA/
-       → (可选) 异步上传 Management API
+       → (可选) 上传 Management API
 ```
 
 - **TARGET**：仅 `CPA/` 探活成功计数  
 - **自动上传失败**不影响账号记为成功  
 - **邮箱预创建**按 target 限流，避免 target=5 时狂开邮箱  
+- **OAuth 默认串行**：每个账号使用独立 Cookie Jar；可重试错误会创建全新的 Device Flow
+- **OAuth 熔断**：默认首次 `invalid_grant` 即停止本轮，失败清单写入 `SSO/oauth-failures.jsonl`
+- **OAuth Web 批准**：默认 `OAUTH_CONFIRM_MODE=browser`，使用同一代理和账号 SSO；如 SSO 被拒，会用注册邮箱/密码在浏览器登录。失败截图写入 `outputs/<run>/oauth-browser/`
+- **browser-mcp 会话隔离**：不导出 SSO/Cookie 值；依赖同标签页 OAuth，并在注册前及关窗前清除该无痕 store 的 x.ai/Grok Cookie。CPA 上传同步完成后才会开始下一账号
 
 ---
 

@@ -59,6 +59,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 			os.Exit(1)
 		}
+	case "reoauth", "reauth", "relogin":
+		if err := cmdReoauth(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
+	case "test-email":
+		if err := cmdTestEmail(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
+	case "mcp-register", "mcpreg":
+		if err := cmdMCPRegister(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
 	case "help", "-h", "--help":
 		printHelp()
 	case "version", "-v", "--version":
@@ -79,6 +94,10 @@ func printHelp() {
   grok stop           立即停止注册机
   grok logs [-f]      查看最近一次运行日志；-f 实时跟踪
   grok upload         选择最近 run 的 CPA JSON 上传到 Management API
+  grok reoauth <path> 对 inspection/CPA/accounts 重新签发并可自动上传 CPA
+  grok test-email --email user@outlook.com
+                      前台用指定邮箱注册一次，手动输入验证码并测试 OAuth/CPA
+  grok mcp-register   通过 browser-mcp 真实 Chrome 注册一个账号（需扩展已连接）
   grok help           显示帮助
 
 数据目录: ~/.grok/ (可用 GROK_HOME 覆盖)
@@ -528,4 +547,3 @@ func cmdUpload() error {
 	fmt.Printf("[✓] 完成 ok=%d fail=%d skip_runs=%d\n", okN, failN, skipN)
 	return nil
 }
-

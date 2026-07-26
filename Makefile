@@ -31,8 +31,12 @@ install:
 	# Playwright mint helper (Turnstile) — same path original project uses
 	install -d /usr/local/share/grok-reg
 	install -m 755 scripts/turnstile_mint.py /usr/local/share/grok-reg/turnstile_mint.py
+	install -m 755 scripts/oauth_approve.py /usr/local/share/grok-reg/oauth_approve.py
+	install -m 755 scripts/signup_browser.py /usr/local/share/grok-reg/signup_browser.py
 	@echo "installed: $(BINDIR)/$(APP)"
 	@echo "installed: /usr/local/share/grok-reg/turnstile_mint.py"
+	@echo "installed: /usr/local/share/grok-reg/oauth_approve.py"
+	@echo "installed: /usr/local/share/grok-reg/signup_browser.py"
 	@echo "try: grok help"
 	@echo "Turnstile: pip install -r scripts/requirements-turnstile.txt && python -m cloakbrowser install"
 
