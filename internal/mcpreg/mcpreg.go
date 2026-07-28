@@ -86,6 +86,7 @@ func Register(ctx context.Context, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("email create: %w", err)
 	}
+	defer opts.EmailProvider.Release(handle)
 	tracef("[mcpreg] email: %s", handle.Email)
 
 	password := opts.Password

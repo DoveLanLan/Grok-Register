@@ -30,12 +30,17 @@ var codeRe = []*regexp.Regexp{
 }
 
 type Handle struct {
-	Kind      string // lol | mt | custom | cftemp
+	Kind      string // lol | mt | custom | cftemp | outlook
 	Email     string
 	Password  string
 	Token     string
 	Base      string // mail.tm base or cloudflare_temp_email Worker root
 	AddressID int64
+	// Microsoft mailbox metadata. The xAI address may be a plus alias while
+	// MainEmail remains the OAuth-authorized inbox used to read its code.
+	MainEmail    string
+	ClientID     string
+	RefreshToken string
 }
 
 type Provider struct {
@@ -47,20 +52,34 @@ type Provider struct {
 	// entries are skipped until the pool would otherwise be empty.
 	cfTempDomains []string
 	cfTempBenched map[string]struct{}
+	outlook       *outlookPool
+	outlookErr    error
 }
 
 type Config struct {
-	Mode          config.EmailMode
-	Domain        string
-	API           string
-	LOLRetries    int
-	LOLIntervalMS int
-	CFTempAPI     string
-	CFTempAdmin   string
-	CFTempDomain  string
-	CFTempAuth    string
-	CFTempPrefix  bool
-	HTTPClient    *http.Client
+	Mode                     config.EmailMode
+	Domain                   string
+	API                      string
+	LOLRetries               int
+	LOLIntervalMS            int
+	CFTempAPI                string
+	CFTempAdmin              string
+	CFTempDomain             string
+	CFTempAuth               string
+	CFTempPrefix             bool
+	OutlookAccountsFile      string
+	OutlookStateFile         string
+	OutlookAliasesPerAccount int
+	OutlookPollInterval      time.Duration
+	HTTPClient               *http.Client
+}
+
+type OutlookAliasPreview struct {
+	MainEmail      string
+	NextEmail      string
+	FollowingEmail string
+	NextIndex      int
+	Remaining      int
 }
 
 func New(cfg Config) *Provider {
@@ -73,11 +92,46 @@ func New(cfg Config) *Provider {
 	if cfg.LOLIntervalMS <= 0 {
 		cfg.LOLIntervalMS = 400
 	}
-	return &Provider{
+	p := &Provider{
 		cfg:           cfg,
 		cfTempDomains: SplitDomains(cfg.CFTempDomain),
 		cfTempBenched: map[string]struct{}{},
 	}
+	if cfg.Mode == config.EmailOutlook {
+		p.outlook, p.outlookErr = newOutlookPool(cfg)
+	}
+	return p
+}
+
+// Validate reports non-transient provider configuration failures. Temporary
+// mailbox API errors remain Create-time errors, while an Outlook pool must be
+// readable before a batch starts.
+func (p *Provider) Validate() error {
+	if p.cfg.Mode == config.EmailOutlook {
+		return p.outlookErr
+	}
+	return nil
+}
+
+// OutlookRemaining returns the number of not-yet-reserved aliases in the
+// persistent pool. The boolean is false for non-Outlook modes.
+func (p *Provider) OutlookRemaining() (int, bool) {
+	if p.cfg.Mode != config.EmailOutlook || p.outlook == nil {
+		return 0, false
+	}
+	return p.outlook.remaining(), true
+}
+
+// OutlookPreviews shows the next generated address for every imported mailbox
+// without reserving it or advancing the persistent cursor.
+func (p *Provider) OutlookPreviews() ([]OutlookAliasPreview, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	if p.cfg.Mode != config.EmailOutlook || p.outlook == nil {
+		return nil, fmt.Errorf("当前不是 Outlook 邮箱模式")
+	}
+	return p.outlook.previews(), nil
 }
 
 // SplitDomains parses a comma/whitespace separated mailbox domain list.
@@ -174,6 +228,14 @@ func (p *Provider) Create() (Handle, error) {
 		}
 		h.Password = password
 		return h, nil
+	case config.EmailOutlook:
+		if p.outlookErr != nil {
+			return Handle{}, p.outlookErr
+		}
+		if p.outlook == nil {
+			return Handle{}, fmt.Errorf("Outlook 邮箱池未初始化")
+		}
+		return p.outlook.reserve(password)
 	}
 	var last error
 	for i := 0; i < p.cfg.LOLRetries; i++ {
@@ -310,6 +372,13 @@ func (p *Provider) mailtmCreate(base, password string) (Handle, error) {
 }
 
 func (p *Provider) PollCode(h Handle, maxWait time.Duration) (string, error) {
+	if h.Kind == "outlook" {
+		defer p.Release(h)
+		if p.outlook == nil {
+			return "", fmt.Errorf("Outlook 邮箱池未初始化")
+		}
+		return p.outlook.pollCode(h, maxWait)
+	}
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
 		text, err := p.fetch(h)
@@ -321,6 +390,15 @@ func (p *Provider) PollCode(h Handle, maxWait time.Duration) (string, error) {
 		time.Sleep(time.Second)
 	}
 	return "", fmt.Errorf("验证码超时")
+}
+
+// Release marks a reserved mailbox as available again. It is intentionally
+// idempotent: PollCode calls it automatically, while pipeline error paths call
+// it when registration fails before code polling starts.
+func (p *Provider) Release(h Handle) {
+	if h.Kind == "outlook" && p.outlook != nil {
+		p.outlook.release(h)
+	}
 }
 
 func (p *Provider) fetch(h Handle) (string, error) {

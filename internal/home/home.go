@@ -14,14 +14,16 @@ const (
 
 // Paths holds all filesystem locations under GROK_HOME.
 type Paths struct {
-	Root      string
-	Config    string
-	PID       string
-	Lock      string
-	State     string
-	LogsDir   string
-	Outputs   string
-	Clearance string // optional: bundled compose path override
+	Root            string
+	Config          string
+	PID             string
+	Lock            string
+	State           string
+	LogsDir         string
+	Outputs         string
+	OutlookAccounts string
+	OutlookState    string
+	Clearance       string // optional: bundled compose path override
 }
 
 func Resolve() (Paths, error) {
@@ -38,13 +40,15 @@ func Resolve() (Paths, error) {
 		return Paths{}, err
 	}
 	p := Paths{
-		Root:    root,
-		Config:  filepath.Join(root, "config.env"),
-		PID:     filepath.Join(root, "run.pid"),
-		Lock:    filepath.Join(root, "run.lock"),
-		State:   filepath.Join(root, "state.json"),
-		LogsDir: filepath.Join(root, "logs"),
-		Outputs: filepath.Join(root, "outputs"),
+		Root:            root,
+		Config:          filepath.Join(root, "config.env"),
+		PID:             filepath.Join(root, "run.pid"),
+		Lock:            filepath.Join(root, "run.lock"),
+		State:           filepath.Join(root, "state.json"),
+		LogsDir:         filepath.Join(root, "logs"),
+		Outputs:         filepath.Join(root, "outputs"),
+		OutlookAccounts: filepath.Join(root, "outlook-accounts.txt"),
+		OutlookState:    filepath.Join(root, "outlook-state.json"),
 	}
 	return p, nil
 }

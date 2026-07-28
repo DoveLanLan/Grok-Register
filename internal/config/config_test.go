@@ -38,3 +38,23 @@ func TestBrowserMCPConfig(t *testing.T) {
 		t.Fatal("BrowserMCPIncognito should honor explicit false")
 	}
 }
+
+func TestOutlookConfigAliasesAndLimits(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"outlook", "hotmail", "microsoft", "ms"} {
+		cfg := Defaults()
+		applyMap(&cfg, map[string]string{
+			"EMAIL_MODE":                  mode,
+			"OUTLOOK_ACCOUNTS_FILE":       "/secure/accounts.txt",
+			"OUTLOOK_STATE_FILE":          "/secure/state.json",
+			"OUTLOOK_ALIASES_PER_ACCOUNT": "8",
+			"OUTLOOK_POLL_INTERVAL_SEC":   "2.5",
+		})
+		if cfg.EmailMode != EmailOutlook || cfg.OutlookAliasesPerAccount != 8 || cfg.OutlookPollIntervalSec != 2.5 {
+			t.Fatalf("mode %q produced %+v", mode, cfg)
+		}
+		if cfg.OutlookAccountsFile != "/secure/accounts.txt" || cfg.OutlookStateFile != "/secure/state.json" {
+			t.Fatalf("paths not loaded for %q: %+v", mode, cfg)
+		}
+	}
+}

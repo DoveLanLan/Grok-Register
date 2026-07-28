@@ -74,6 +74,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 			os.Exit(1)
 		}
+	case "outlook":
+		if err := cmdOutlook(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
 	case "help", "-h", "--help":
 		printHelp()
 	case "version", "-v", "--version":
@@ -98,6 +103,8 @@ func printHelp() {
   grok test-email --email user@outlook.com
                       前台用指定邮箱注册一次，手动输入验证码并测试 OAuth/CPA
   grok mcp-register   通过 browser-mcp 真实 Chrome 注册一个账号（需扩展已连接）
+  grok outlook import <path>
+                      导入 Outlook 账号池（邮箱----密码----ClientID----RefreshToken）
   grok help           显示帮助
 
 数据目录: ~/.grok/ (可用 GROK_HOME 覆盖)

@@ -11,13 +11,14 @@ grok logs -f
 grok stop
 grok upload    # 手动上传 CPA JSON 到 Management API
 grok test-email --email user@outlook.com  # 用真实邮箱做一次前台验证
+grok outlook import ./accounts.txt         # 导入 Outlook 主邮箱与 OAuth 凭证
 ```
 
 ---
 
 ## 功能
 
-- 临时邮箱 / 自建域名邮箱注册
+- 临时邮箱 / 自建域名邮箱 / Outlook plus-address 别名池注册
 - 注册成功后立刻 Device Flow OAuth
 - 整备 `cli-chat-proxy` + grok-cli headers 的 CPA JSON
 - 可选探活；可选自动上传到 CPA Management API
@@ -255,6 +256,34 @@ grok mcp-register       # 前台注册一个
 
 browser-mcp 会轮询页面中的 Turnstile 响应长度、挑战可见状态和提交按钮状态；若 Cloudflare 要求人工点击，可直接在弹出的真实 Chrome 窗口完成。每个账号强制使用无痕窗口；开始注册前和关闭窗口前都会清除该无痕 Cookie store 中的 x.ai/Grok 登录 Cookie（不向 Go 返回 Cookie 值）。成功、失败或取消都会关闭账号标签页，下一账号不会继承上一个账号。
 
+Outlook / Hotmail 别名池（可选）：
+
+```bash
+# 每行：邮箱----密码----ClientID----RefreshToken
+grok outlook import ./outlook-accounts.txt
+```
+
+然后设置：
+
+```env
+EMAIL_MODE=outlook
+# 每个主邮箱生成 5 个随机 plus-tag 地址
+OUTLOOK_ALIASES_PER_ACCOUNT=5
+# 导入命令默认使用以下路径，通常不必显式配置
+# OUTLOOK_ACCOUNTS_FILE=/root/.grok/outlook-accounts.txt
+# OUTLOOK_STATE_FILE=/root/.grok/outlook-state.json
+OUTLOOK_POLL_INTERVAL_SEC=5
+```
+
+该模式不向 Microsoft 创建新的账户级别名，而是为每个主邮箱生成稳定的随机
+plus-tag，例如 `user+k7m2q9x4ab@outlook.com`。邮件仍从
+`user@outlook.com` 的收件箱读取。每个主邮箱的随机种子、已分配下标及轮换后的
+RefreshToken 都持久化到 `outlook-state.json`，所以 `check` 预览、随后
+`allocate` 的结果及程序重启后的地址保持一致，也不会退回顺序编号。
+程序会依次探测 Microsoft Graph、旧 Outlook REST 和 IMAP XOAUTH2。同一主邮箱
+同时只允许一个别名等待验证码，以免多封邮件串码。导入格式里的邮箱密码不会用于
+登录或作为 Grok 密码。
+
 自建邮箱（可选）：
 
 ```env
@@ -289,6 +318,7 @@ grok upload
 ```text
 ~/.grok/
 ├── config.env
+├── outlook-accounts.txt / outlook-state.json  # EMAIL_MODE=outlook 时使用
 ├── run.pid / run.lock / state.json
 ├── logs/run-yyyymmdd-HHMMSS.log
 └── outputs/
@@ -331,6 +361,9 @@ sudo /opt/cloakbrowser-venv/bin/pip install -r scripts/requirements-turnstile.tx
 | `grok upload` | 交互选择最近 10 次 run，上传其中 CPA JSON |
 | `grok test-email --email ADDRESS` | 前台用指定真实邮箱注册一次，手动输入验证码并测试 OAuth/CPA |
 | `grok mcp-register` | 强制使用 browser-mcp 真实 Chrome 前台注册一个账号 |
+| `grok outlook import FILE` | 校验并导入 Outlook 主邮箱 OAuth 凭证池 |
+| `grok outlook check` | 预览下一个 Outlook 地址，不消耗游标 |
+| `grok outlook allocate` | 分配下一个 Outlook 地址并推进游标 |
 
 ---
 

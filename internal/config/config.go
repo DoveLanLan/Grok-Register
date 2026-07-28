@@ -15,6 +15,8 @@ const (
 	EmailCustom   EmailMode = "custom"
 	// EmailCFTemp connects to a self-hosted dreamhunter2333/cloudflare_temp_email Worker.
 	EmailCFTemp EmailMode = "cf_temp_email"
+	// EmailOutlook uses imported Microsoft mailboxes and their plus-address aliases.
+	EmailOutlook EmailMode = "outlook"
 )
 
 type Config struct {
@@ -27,6 +29,11 @@ type Config struct {
 	CFTempEmailDomain string
 	CFTempEmailAuth   string
 	CFTempEmailPrefix bool
+
+	OutlookAccountsFile      string
+	OutlookStateFile         string
+	OutlookAliasesPerAccount int
+	OutlookPollIntervalSec   float64
 
 	ClearanceEnabled bool
 	RegisterProxy    string
@@ -91,6 +98,8 @@ func Defaults() Config {
 		EmailMode:                 EmailTempmail,
 		EmailAPI:                  "http://127.0.0.1:8080",
 		CFTempEmailPrefix:         true,
+		OutlookAliasesPerAccount:  5,
+		OutlookPollIntervalSec:    5,
 		ClearanceEnabled:          true,
 		RegisterProxy:             "http://127.0.0.1:40080",
 		FlareSolverrURL:           "http://127.0.0.1:8191",
@@ -163,6 +172,14 @@ func Save(path string, cfg Config) error {
 		b.WriteString(fmt.Sprintf("CF_TEMP_EMAIL_DOMAIN=%s\n", cfg.CFTempEmailDomain))
 	}
 	b.WriteString(fmt.Sprintf("CF_TEMP_EMAIL_PREFIX=%s\n", bool01(cfg.CFTempEmailPrefix)))
+	if cfg.OutlookAccountsFile != "" {
+		b.WriteString(fmt.Sprintf("OUTLOOK_ACCOUNTS_FILE=%s\n", cfg.OutlookAccountsFile))
+	}
+	if cfg.OutlookStateFile != "" {
+		b.WriteString(fmt.Sprintf("OUTLOOK_STATE_FILE=%s\n", cfg.OutlookStateFile))
+	}
+	b.WriteString(fmt.Sprintf("OUTLOOK_ALIASES_PER_ACCOUNT=%d\n", cfg.OutlookAliasesPerAccount))
+	b.WriteString(fmt.Sprintf("OUTLOOK_POLL_INTERVAL_SEC=%g\n", cfg.OutlookPollIntervalSec))
 	b.WriteString(fmt.Sprintf("CLEARANCE_ENABLED=%s\n", bool01(cfg.ClearanceEnabled)))
 	b.WriteString(fmt.Sprintf("REGISTER_PROXY=%s\n", cfg.RegisterProxy))
 	b.WriteString(fmt.Sprintf("REGISTER_PROXIES=%s\n", cfg.RegisterProxies))
@@ -212,7 +229,8 @@ func InteractiveSetup(path string) (Config, error) {
 	fmt.Println("  [1] 免费临时邮箱           (默认 · 零配置 · 直接回车)")
 	fmt.Println("  [2] 自建域名邮箱 webhook   (需 Cloudflare Email Routing + 本地 webhook)")
 	fmt.Println("  [3] cloudflare_temp_email  (自建 Worker API)")
-	fmt.Print("输入 1 / 2 / 3 [1]: ")
+	fmt.Println("  [4] Outlook 别名池          (先用 grok outlook import 导入账号)")
+	fmt.Print("输入 1 / 2 / 3 / 4 [1]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -239,6 +257,13 @@ func InteractiveSetup(path string) (Config, error) {
 		fmt.Print("  Admin 密钥 (公共建号已启用可留空): ")
 		admin, _ := reader.ReadString('\n')
 		cfg.CFTempEmailAdmin = strings.TrimSpace(admin)
+	} else if line == "4" {
+		cfg.EmailMode = EmailOutlook
+		fmt.Print("  每个主邮箱生成几个随机 plus-tag 地址 [5]: ")
+		aliases, _ := reader.ReadString('\n')
+		if n, err := strconv.Atoi(strings.TrimSpace(aliases)); err == nil && n > 0 {
+			cfg.OutlookAliasesPerAccount = n
+		}
 	} else {
 		cfg.EmailMode = EmailTempmail
 	}
@@ -284,6 +309,8 @@ func applyMap(cfg *Config, env map[string]string) {
 		switch mode {
 		case "cf_temp", "cf-temp", "cftemp", "cloudflare_temp_email", "cloudflare-temp-email":
 			cfg.EmailMode = EmailCFTemp
+		case "outlook", "hotmail", "microsoft", "ms":
+			cfg.EmailMode = EmailOutlook
 		default:
 			cfg.EmailMode = EmailMode(mode)
 		}
@@ -316,6 +343,22 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["CF_TEMP_EMAIL_PREFIX"]; ok {
 		cfg.CFTempEmailPrefix = truthy(v)
+	}
+	if v, ok := env["OUTLOOK_ACCOUNTS_FILE"]; ok {
+		cfg.OutlookAccountsFile = strings.TrimSpace(v)
+	}
+	if v, ok := env["OUTLOOK_STATE_FILE"]; ok {
+		cfg.OutlookStateFile = strings.TrimSpace(v)
+	}
+	if v, ok := env["OUTLOOK_ALIASES_PER_ACCOUNT"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.OutlookAliasesPerAccount = n
+		}
+	}
+	if v, ok := env["OUTLOOK_POLL_INTERVAL_SEC"]; ok {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
+			cfg.OutlookPollIntervalSec = n
+		}
 	}
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)

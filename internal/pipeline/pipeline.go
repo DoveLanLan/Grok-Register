@@ -535,18 +535,41 @@ func (e *Engine) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	outlookAccountsFile := strings.TrimSpace(cfg.OutlookAccountsFile)
+	if outlookAccountsFile == "" {
+		outlookAccountsFile = e.opt.Paths.OutlookAccounts
+	}
+	outlookStateFile := strings.TrimSpace(cfg.OutlookStateFile)
+	if outlookStateFile == "" {
+		outlookStateFile = e.opt.Paths.OutlookState
+	}
 	e.mail = email.New(email.Config{
-		Mode:          cfg.EmailMode,
-		Domain:        cfg.EmailDomain,
-		API:           cfg.EmailAPI,
-		LOLRetries:    cfg.TempmailLOLRetries,
-		LOLIntervalMS: cfg.TempmailLOLIntervalMS,
-		CFTempAPI:     cfg.CFTempEmailAPI,
-		CFTempAdmin:   cfg.CFTempEmailAdmin,
-		CFTempDomain:  cfg.CFTempEmailDomain,
-		CFTempAuth:    cfg.CFTempEmailAuth,
-		CFTempPrefix:  cfg.CFTempEmailPrefix,
+		Mode:                     cfg.EmailMode,
+		Domain:                   cfg.EmailDomain,
+		API:                      cfg.EmailAPI,
+		LOLRetries:               cfg.TempmailLOLRetries,
+		LOLIntervalMS:            cfg.TempmailLOLIntervalMS,
+		CFTempAPI:                cfg.CFTempEmailAPI,
+		CFTempAdmin:              cfg.CFTempEmailAdmin,
+		CFTempDomain:             cfg.CFTempEmailDomain,
+		CFTempAuth:               cfg.CFTempEmailAuth,
+		CFTempPrefix:             cfg.CFTempEmailPrefix,
+		OutlookAccountsFile:      outlookAccountsFile,
+		OutlookStateFile:         outlookStateFile,
+		OutlookAliasesPerAccount: cfg.OutlookAliasesPerAccount,
+		OutlookPollInterval:      time.Duration(cfg.OutlookPollIntervalSec * float64(time.Second)),
 	})
+	if err := e.mail.Validate(); err != nil {
+		return fmt.Errorf("邮箱配置: %w", err)
+	}
+	if remaining, ok := e.mail.OutlookRemaining(); ok {
+		if remaining < e.opt.Target {
+			return fmt.Errorf("Outlook 别名池只剩 %d 个地址，少于本次目标 %d；请导入更多主邮箱或提高 OUTLOOK_ALIASES_PER_ACCOUNT", remaining, e.opt.Target)
+		}
+		if remaining < e.opt.Target+2 {
+			log.Warnf("Outlook 别名池剩余 %d、目标 %d，几乎没有失败重试余量", remaining, e.opt.Target)
+		}
+	}
 	if cfg.EmailMode == config.EmailCFTemp {
 		pool := e.mail.CFTempDomainPool()
 		domain := strings.Join(pool, ",")
@@ -559,6 +582,9 @@ func (e *Engine) run(ctx context.Context) error {
 			// volume and every account starts coming back invalid_grant.
 			log.Warnf("CF_TEMP_EMAIL_DOMAIN 只配了 1 个域名，大批量注册会烧掉它；建议逗号分隔多个域名轮换")
 		}
+	}
+	if cfg.EmailMode == config.EmailOutlook {
+		log.Infof("Email mode=outlook accounts=%s aliases_per_account=%d state=%s", outlookAccountsFile, cfg.OutlookAliasesPerAccount, outlookStateFile)
 	}
 	e.turn = turnstile.New(turnstile.Options{
 		Provider: cfg.TurnstileProvider,
@@ -870,6 +896,7 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 		}
 		session := newAccountSession(h, e.opt.Cfg.RegisterProxy)
 		if err := e.xai.CreateEmailCode(session.Email); err != nil {
+			e.mail.Release(h)
 			e.qPending.Release()
 			log.Debugf("[P%d] create code %s: %v", id, session.Email, err)
 			select {
@@ -1204,6 +1231,7 @@ func (e *Engine) pWorkerBrowser(ctx context.Context, id int) {
 		session := newAccountSession(h, e.nextAccountProxy())
 		item := QItem{Session: session}
 		if err := e.inv.PutQ(ctx, item, 5*time.Minute); err != nil {
+			e.mail.Release(h)
 			e.qPending.Release()
 			return
 		}
@@ -1349,6 +1377,7 @@ func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 			_ = pctx
 			return e.mail.PollCode(session.Handle, 100*time.Second)
 		})
+		e.mail.Release(session.Handle)
 		e.phys.Release()
 		env.Release()
 		if regErr != nil || !result.OK {

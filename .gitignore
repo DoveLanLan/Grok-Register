@@ -21,6 +21,8 @@ Thumbs.db
 config.env
 *.pem
 *.key
+outlook-accounts*.txt
+outlook-state*.json
 
 # Go
 vendor/
