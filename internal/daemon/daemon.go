@@ -184,7 +184,28 @@ func FormatStatus(snap state.Snapshot) string {
 	} else if snap.Phase != "" && snap.Phase != state.PhaseIdle {
 		b.WriteString(fmt.Sprintf("当前: %s\n", snap.Phase))
 	}
-	if snap.SSOCount > 0 || snap.OAuthCount > 0 {
+	funnel := snap.Funnel
+	if funnel.AccountsStarted > 0 || funnel.Attempts > 0 || funnel.Registrations > 0 {
+		b.WriteString(fmt.Sprintf(
+			"漏斗: 账号=%d 尝试=%d 注册=%d(首次=%d 重试=%d) SSO=%d OAuth=%d CPA=%d 尝试失败=%d\n",
+			funnel.AccountsStarted,
+			funnel.Attempts,
+			funnel.Registrations,
+			funnel.FirstPassRegistrations,
+			funnel.RetryRegistrations,
+			funnel.SSO,
+			funnel.OAuth,
+			funnel.CPA,
+			funnel.AttemptFailures,
+		))
+		b.WriteString(fmt.Sprintf(
+			"转化: 首次=%s 重试后=%s OAuth/注册=%s CPA/注册=%s\n",
+			formatPercent(funnel.FirstPassRegistrations, funnel.AccountsStarted),
+			formatPercent(funnel.Registrations, funnel.AccountsStarted),
+			formatPercent(funnel.OAuth, funnel.Registrations),
+			formatPercent(funnel.CPA, funnel.Registrations),
+		))
+	} else if snap.SSOCount > 0 || snap.OAuthCount > 0 {
 		b.WriteString(fmt.Sprintf("统计: SSO=%d OAuth=%d fail=%d\n", snap.SSOCount, snap.OAuthCount, snap.FailCount))
 	}
 	if snap.RatePerMin > 0 {
@@ -203,4 +224,11 @@ func FormatStatus(snap state.Snapshot) string {
 		b.WriteString(fmt.Sprintf("错误: %s\n", snap.Error))
 	}
 	return b.String()
+}
+
+func formatPercent(value, total int) string {
+	if total <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f%%", float64(value)*100/float64(total))
 }

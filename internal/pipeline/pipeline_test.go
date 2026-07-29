@@ -17,11 +17,14 @@ import (
 
 	"github.com/grok-free-register/grok-reg/internal/config"
 	"github.com/grok-free-register/grok-reg/internal/cpa"
+	"github.com/grok-free-register/grok-reg/internal/egress"
 	"github.com/grok-free-register/grok-reg/internal/email"
 	"github.com/grok-free-register/grok-reg/internal/home"
 	"github.com/grok-free-register/grok-reg/internal/inventory"
 	"github.com/grok-free-register/grok-reg/internal/logx"
 	"github.com/grok-free-register/grok-reg/internal/oauth"
+	"github.com/grok-free-register/grok-reg/internal/riskstate"
+	"github.com/grok-free-register/grok-reg/internal/signup"
 	"github.com/grok-free-register/grok-reg/internal/state"
 )
 
@@ -510,5 +513,139 @@ func TestCompleteAccountDoesNotExceedTargetDuringSlowUpload(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(run.Discarded); err != nil || len(entries) != 1 {
 		t.Fatalf("discarded entries = %d, err=%v", len(entries), err)
+	}
+}
+
+func TestBrowserSignupRetryPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		result signup.BrowserResult
+		err    error
+		want   bool
+	}{
+		{name: "turnstile", result: signup.BrowserResult{Stage: "turnstile_stuck"}, err: errors.New("turnstile_not_passed_after_retries"), want: true},
+		{name: "navigation", result: signup.BrowserResult{Stage: "browser_error"}, err: errors.New("navigate_failed: timeout"), want: true},
+		{name: "rate limit", result: signup.BrowserResult{Stage: "browser_error"}, err: errors.New("email_code_rate_limited"), want: false},
+		{name: "invalid code", result: signup.BrowserResult{Stage: "browser_error"}, err: errors.New("invalid_or_expired_code"), want: false},
+		{name: "missing dependency", result: signup.BrowserResult{Stage: "bootstrap_error"}, err: errors.New("Camoufox is not installed"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := browserSignupRetryable(test.result, test.err); got != test.want {
+				t.Fatalf("browserSignupRetryable() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRegistrationMetricIsCredentialSafe(t *testing.T) {
+	root := t.TempDir()
+	engine := &Engine{opt: Options{
+		Cfg: config.Config{RegisterMode: "camoufox"},
+		Run: home.RunDirs{Root: root},
+	}}
+	session := &AccountSession{
+		DiagnosticID: "diag-123",
+		Proxy:        "http://proxy-user:proxy-password@proxy.example:8080",
+		Email:        "secret@example.com",
+		Password:     "account-password",
+		Egress: egress.Profile{
+			IP:          "203.0.113.8",
+			ASN:         64512,
+			ISP:         "Example ISP",
+			CountryCode: "US",
+		},
+	}
+	engine.recordRegistrationMetric(session, 2, "registration", "failure", errors.New("turnstile timeout"))
+	data, err := os.ReadFile(filepath.Join(root, "registration-metrics.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, secret := range []string{"secret@example.com", "account-password", "proxy-user", "proxy-password"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("metric leaked %q: %s", secret, text)
+		}
+	}
+	if !strings.Contains(text, `"diagnostic_id":"diag-123"`) || !strings.Contains(text, `"asn":64512`) {
+		t.Fatalf("metric missing safe dimensions: %s", text)
+	}
+}
+
+func TestInvalidGrantSwitchesDomainMailToOutlookAndBlocksPair(t *testing.T) {
+	root := t.TempDir()
+	accountsPath := filepath.Join(root, "outlook-accounts.txt")
+	if err := os.WriteFile(
+		accountsPath,
+		[]byte("fallback@outlook.com----mail-pass----client-id----refresh-token\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	provider := email.New(email.Config{
+		Mode:                     config.EmailCustom,
+		Domain:                   "domain.example",
+		InvalidGrantFallback:     "outlook",
+		OutlookAccountsFile:      accountsPath,
+		OutlookStateFile:         filepath.Join(root, "outlook-state.json"),
+		OutlookAliasesPerAccount: 3,
+	})
+	if err := provider.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := riskstate.Open(filepath.Join(root, "invalid-grants.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &Engine{
+		opt:  Options{Cfg: config.Config{OAuthInvalidGrantLimit: 3}},
+		mail: provider,
+		risk: registry,
+	}
+	engine.oauthInvalidGrantStreak.Store(2)
+	domainSession := &AccountSession{
+		DiagnosticID: "diag-domain",
+		Email:        "person@domain.example",
+		Handle:       email.Handle{Kind: "custom", Email: "person@domain.example"},
+		Proxy:        "http://proxy-user:proxy-pass@p.webshare.io:80",
+		Egress:       egress.Profile{IP: "203.0.113.9", ASN: 64512, ISP: "Residential ISP"},
+	}
+	engine.noteOAuthOutcomeForSession(domainSession, &oauth.RejectionError{Code: "invalid_grant", Description: "Access denied"})
+
+	if !provider.UsingOutlook() {
+		t.Fatal("domain invalid_grant did not switch future mailboxes to Outlook")
+	}
+	if got := engine.oauthInvalidGrantStreak.Load(); got != 0 {
+		t.Fatalf("domain fallback should reset the Outlook breaker budget, got %d", got)
+	}
+	if !registry.EmailBlocked(domainSession.Email) || !registry.IPBlocked(domainSession.Egress.IP) || !registry.FallbackToOutlook() {
+		t.Fatal("invalid_grant email/IP/fallback markers were not persisted")
+	}
+	if engine.accountCandidateAllowed(domainSession) {
+		t.Fatal("stale domain mailbox/IP should be rejected after fallback")
+	}
+
+	outlookHandle, err := provider.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outlookHandle.Kind != "outlook" {
+		t.Fatalf("future allocation kind = %q", outlookHandle.Kind)
+	}
+	outlookSession := &AccountSession{
+		DiagnosticID: "diag-outlook",
+		Email:        outlookHandle.Email,
+		Handle:       outlookHandle,
+		Egress:       egress.Profile{IP: "203.0.113.10"},
+	}
+	if !engine.accountCandidateAllowed(outlookSession) {
+		t.Fatal("fresh Outlook mailbox and IP should be allowed")
+	}
+	engine.noteOAuthOutcomeForSession(outlookSession, &oauth.RejectionError{Code: "invalid_grant"})
+	if got := engine.oauthInvalidGrantStreak.Load(); got != 1 {
+		t.Fatalf("Outlook invalid_grant streak = %d, want 1", got)
+	}
+	if !registry.EmailBlocked(outlookSession.Email) || !registry.IPBlocked(outlookSession.Egress.IP) {
+		t.Fatal("Outlook invalid_grant pair was not blocked")
 	}
 }

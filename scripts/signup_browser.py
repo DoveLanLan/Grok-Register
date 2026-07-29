@@ -369,6 +369,71 @@ async def read_sso_cookie(context) -> str:
 DEFAULT_TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 
 
+class _CamoufoxRuntime:
+    """Small adapter that exposes Camoufox through Playwright's launch shape.
+
+    Keeping the browser boundary compatible lets both engines execute the exact
+    same signup/OAuth flow; only the engine and fingerprint construction differ.
+    """
+
+    def __init__(self, config: dict, headless: bool, proxy: str):
+        self._config = config
+        self._headless = headless
+        self._proxy = proxy
+        self._manager = None
+        self.chromium = self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._manager is not None:
+            manager, self._manager = self._manager, None
+            await manager.__aexit__(exc_type, exc, tb)
+
+    async def launch(self, **_ignored):
+        try:
+            from camoufox.async_api import AsyncCamoufox
+        except Exception as exc:
+            raise RuntimeError(
+                "Camoufox is not installed; pip install 'camoufox[geoip]>=0.5.4' "
+                "and run: camoufox fetch"
+            ) from exc
+
+        egress = self._config.get("egress") or {}
+        locale = str(egress.get("locale") or "en-US").strip()
+        timezone = str(egress.get("timezone") or "").strip()
+        latitude = float(egress.get("latitude") or 0)
+        longitude = float(egress.get("longitude") or 0)
+        exit_ip = str(egress.get("ip") or "").strip()
+        camou_config = {}
+        # Prefer Camoufox's GeoIP pipeline whenever the preflight resolved an
+        # exit IP. It configures the full fingerprint coherently and avoids the
+        # manual-geolocation leak warning. Manual values are only a fallback.
+        if not exit_ip:
+            if timezone:
+                camou_config["timezone"] = timezone
+            if latitude or longitude:
+                camou_config["geolocation:latitude"] = latitude
+                camou_config["geolocation:longitude"] = longitude
+
+        options = {
+            "headless": self._headless,
+            "humanize": True,
+            "block_webrtc": True,
+            "locale": locale,
+            "config": camou_config,
+            "i_know_what_im_doing": True,
+        }
+        if self._proxy:
+            options["proxy"] = playwright_proxy(self._proxy)
+        if exit_ip:
+            options["geoip"] = exit_ip
+
+        self._manager = AsyncCamoufox(**options)
+        return await self._manager.__aenter__()
+
+
 async def maybe_click_turnstile(page) -> str:
     # Best-effort: real widget is in an iframe; CloakBrowser often auto-passes.
     frames = list(page.frames)
@@ -446,18 +511,20 @@ async def turnstile_token_present(page) -> bool:
                             || input.getAttribute("data-turnstile-response")
                             || input.textContent
                             || "").trim();
-                        if (val.length > 20) return true;
+                        if (val.length >= 80) return true;
                     }
                 }
                 for (const w of document.querySelectorAll("[data-sitekey], .cf-turnstile")) {
                     const resp = w.querySelector('input[type="hidden"], textarea');
-                    if (resp && (resp.value || "").trim().length > 20) return true;
+                    if (resp && (resp.value || "").trim().length >= 80) return true;
                     const attr = w.getAttribute("data-turnstile-response") || "";
-                    if (attr.length > 20) return true;
+                    if (attr.length >= 80) return true;
                 }
-                for (const input of document.querySelectorAll('input[type="hidden"], textarea')) {
-                    const val = (input.value || "").trim();
-                    if (val.length > 40 && (val.startsWith("0.") || val.length > 100)) return true;
+                if (window.turnstile && typeof window.turnstile.getResponse === "function") {
+                    try {
+                        const response = String(window.turnstile.getResponse() || "").trim();
+                        if (response.length >= 80) return true;
+                    } catch (_) {}
                 }
                 return false;
             }'''
@@ -586,16 +653,23 @@ async def inject_turnstile_widget(page, site_key: str = "") -> str:
         return "turnstile:inject_error:" + re.sub(r"\s+", " ", str(exc))[:60]
 
 
-async def wait_for_turnstile(page, actions: list[str], timeout_sec: float = 45) -> bool:
+async def wait_for_turnstile(
+    page,
+    actions: list[str],
+    timeout_sec: float = 45,
+    *,
+    allow_inject: bool = False,
+    inject_after_sec: float = 35.0,
+) -> bool:
     """Wait for Turnstile to complete before submitting the form.
 
     Strategy (in order, looped until timeout):
     1. Detect an already-minted cf-turnstile / turnstileToken value.
-    2. Detect iframe success / checkmark state.
+    2. Observe iframe success / checkmark state, but require the host token.
     3. Click interactive checkbox if present.
-    4. After a short grace period, inject an explicit widget (mint path) so
-       low-quality proxies that never surface the managed challenge can still
-       produce a token.
+    4. Optionally inject an explicit widget only after a long native grace
+       period. Injection is disabled by default because a standalone token can
+       miss application-specific action/state binding.
     """
     clicked_once = False
     injected = False
@@ -613,11 +687,11 @@ async def wait_for_turnstile(page, actions: list[str], timeout_sec: float = 45) 
                     actions.append("turnstile:passed")
                 return True
             if await turnstile_visual_success(page):
-                actions.append("turnstile:visual_success")
-                return True
-        except Exception:
-            actions.append("turnstile:navigated_away")
-            return True
+                if "turnstile:visual_success_pending_token" not in actions[-4:]:
+                    actions.append("turnstile:visual_success_pending_token")
+        except Exception as exc:
+            actions.append("turnstile:token_check_error:" + type(exc).__name__)
+            return False
 
         # Check iframe success state.
         for frame in page.frames:
@@ -648,10 +722,13 @@ async def wait_for_turnstile(page, actions: list[str], timeout_sec: float = 45) 
                         if await turnstile_token_present(page):
                             actions.append("turnstile:iframe_success")
                             return True
-                    except Exception:
-                        actions.append("turnstile:navigated_away")
-                        return True
-                    actions.append("turnstile:iframe_success_pending")
+                    except Exception as exc:
+                        actions.append(
+                            "turnstile:iframe_token_error:" + type(exc).__name__
+                        )
+                        continue
+                    if "turnstile:iframe_success_pending" not in actions[-4:]:
+                        actions.append("turnstile:iframe_success_pending")
             except Exception:
                 pass
 
@@ -664,10 +741,10 @@ async def wait_for_turnstile(page, actions: list[str], timeout_sec: float = 45) 
                 await page.wait_for_timeout(random.randint(1800, 3200))
                 continue
 
-        # After ~5s with no progress, inject an explicit widget. This is the
-        # path that helps flaky proxies that never auto-pass managed Turnstile.
+        # Explicit injection is opt-in and delayed so the page's managed widget
+        # always gets the primary opportunity to mint its bound response.
         elapsed = time.monotonic() - started
-        if not injected and elapsed >= 5.0:
+        if allow_inject and not injected and elapsed >= max(10.0, inject_after_sec):
             status = await inject_turnstile_widget(page)
             actions.append(status)
             injected = True
@@ -695,11 +772,10 @@ async def wait_for_turnstile(page, actions: list[str], timeout_sec: float = 45) 
             actions.append("turnstile:passed_late")
             return True
         if await turnstile_visual_success(page):
-            actions.append("turnstile:visual_success_late")
-            return True
-    except Exception:
-        actions.append("turnstile:navigated_away")
-        return True
+            actions.append("turnstile:visual_success_late_without_token")
+    except Exception as exc:
+        actions.append("turnstile:late_check_error:" + type(exc).__name__)
+        return False
     actions.append("turnstile:timeout")
     return False
 
@@ -1501,6 +1577,18 @@ async def register(config: dict) -> dict:
     timeout = max(45.0, min(float(config.get("timeout_sec") or 180), 420.0))
     code_timeout = max(20.0, min(float(config.get("code_timeout_sec") or 100), 180.0))
     headless = bool(config.get("headless", True))
+    engine = str(config.get("engine") or "chromium").strip().lower()
+    if engine not in ("chromium", "camoufox"):
+        raise ValueError(f"unsupported browser engine: {engine}")
+    egress = config.get("egress") if isinstance(config.get("egress"), dict) else {}
+    locale = str(egress.get("locale") or "en-US").strip()
+    timezone_id = str(egress.get("timezone") or "").strip()
+    latitude = float(egress.get("latitude") or 0)
+    longitude = float(egress.get("longitude") or 0)
+    allow_turnstile_inject = bool(config.get("turnstile_inject_fallback", False))
+    turnstile_inject_after = max(
+        10.0, float(config.get("turnstile_inject_after_sec") or 35.0)
+    )
     chrome = str(config.get("chrome") or "").strip() or find_chrome()
     page_url = str(config.get("url") or "https://accounts.x.ai/sign-up?redirect=grok-com").strip()
     verification_url = str(config.get("verification_url") or "").strip()
@@ -1516,7 +1604,7 @@ async def register(config: dict) -> dict:
         family = random.choice(
             ["Smith", "Johnson", "Brown", "Taylor", "Wilson", "Moore", "Clark"]
         )
-    if not chrome:
+    if engine == "chromium" and not chrome:
         raise RuntimeError("CloakBrowser/Chromium executable not found")
     if not code_file and not inline_code:
         raise ValueError("code_file or code is required")
@@ -1532,25 +1620,47 @@ async def register(config: dict) -> dict:
             "--disable-infobars",
             "--disable-dev-shm-usage",
             "--window-size=1280,900",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--enforce-webrtc-ip-permission-check",
         ],
     }
     if proxy:
         launch["proxy"] = playwright_proxy(proxy)
 
     actions: list[str] = []
-    async with async_playwright() as playwright:
+    runtime = (
+        _CamoufoxRuntime(config, headless, proxy)
+        if engine == "camoufox"
+        else async_playwright()
+    )
+    async with runtime as playwright:
         browser = await playwright.chromium.launch(**launch)
         page = None
         try:
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                ignore_https_errors=True,
-            )
-            await context.add_init_script(
-                'Object.defineProperty(navigator,"webdriver",{get:()=>undefined})'
-            )
+            context_options = {
+                "locale": locale,
+                "ignore_https_errors": True,
+            }
+            if engine == "chromium":
+                context_options["viewport"] = {"width": 1280, "height": 900}
+            if timezone_id:
+                context_options["timezone_id"] = timezone_id
+            if latitude or longitude:
+                context_options["geolocation"] = {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                }
+                context_options["permissions"] = ["geolocation"]
+            context = await browser.new_context(**context_options)
+            if engine == "chromium":
+                await context.add_init_script(
+                    'Object.defineProperty(navigator,"webdriver",{get:()=>undefined})'
+                )
             page = await context.new_page()
+            actions.append(
+                f"browser:{engine}:locale={locale}:tz={timezone_id or 'unknown'}"
+            )
 
             last_err = None
             for attempt in range(4):
@@ -1944,17 +2054,22 @@ async def register(config: dict) -> dict:
                 if turnstile_rounds < max_turnstile_rounds:
                     wait_sec = 55 if turnstile_rounds == 0 else 28
                     turnstile_ok = await wait_for_turnstile(
-                        page, actions, timeout_sec=wait_sec
+                        page,
+                        actions,
+                        timeout_sec=wait_sec,
+                        allow_inject=allow_turnstile_inject,
+                        inject_after_sec=turnstile_inject_after,
                     )
                     turnstile_rounds += 1
                     if not turnstile_ok:
                         if await turnstile_visual_success(page):
-                            actions.append("turnstile:visual_success_submit")
-                            turnstile_ok = True
-                        else:
-                            actions.append(
-                                f"turnstile:timeout_try_submit:{turnstile_rounds}"
-                            )
+                            actions.append("turnstile:visual_success_without_token")
+                        actions.append(f"turnstile:timeout_no_submit:{turnstile_rounds}")
+
+                    if not turnstile_ok:
+                        # Never treat a visual checkmark as a bound response. A
+                        # later round may still expose the host token.
+                        continue
 
                     await page.wait_for_timeout(random.randint(500, 1100))
                     clicked = await click_positive_action(
@@ -2062,7 +2177,8 @@ async def register(config: dict) -> dict:
                 "screenshot": screenshot,
             }
         finally:
-            await browser.close()
+            if engine != "camoufox":
+                await browser.close()
 
 
 def main() -> int:

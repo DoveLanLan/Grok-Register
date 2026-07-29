@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/grok-free-register/grok-reg/internal/browsermcp"
+	"github.com/grok-free-register/grok-reg/internal/egress"
 )
 
 const mcpSignupURL = "https://accounts.x.ai/sign-up?redirect=grok-com"
@@ -56,6 +57,7 @@ type MCPBrowser struct {
 
 	mu        sync.Mutex
 	proxy     string
+	egress    egress.Profile
 	newClient func(browsermcp.Options) mcpRPC
 }
 
@@ -135,8 +137,9 @@ func NewMCPBrowser(opt MCPBrowserOptions) *MCPBrowser {
 
 func (b *MCPBrowser) Name() string { return "browser-mcp-signup" }
 
-func (b *MCPBrowser) SetProxy(proxy string) { b.proxy = strings.TrimSpace(proxy) }
-func (b *MCPBrowser) Proxy() string         { return b.proxy }
+func (b *MCPBrowser) SetProxy(proxy string)            { b.proxy = strings.TrimSpace(proxy) }
+func (b *MCPBrowser) Proxy() string                    { return b.proxy }
+func (b *MCPBrowser) SetEgress(profile egress.Profile) { b.egress = profile }
 func (b *MCPBrowser) SetDiagnosticDir(path string) {
 	b.opt.DiagnosticDir = strings.TrimSpace(path)
 }

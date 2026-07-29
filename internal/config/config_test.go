@@ -39,6 +39,30 @@ func TestBrowserMCPConfig(t *testing.T) {
 	}
 }
 
+func TestCamoufoxEgressAndTurnstileConfig(t *testing.T) {
+	cfg := Defaults()
+	applyMap(&cfg, map[string]string{
+		"REGISTER_MODE":              "camou",
+		"EGRESS_STRICT":              "1",
+		"EGRESS_REJECT_HOSTING":      "true",
+		"EGRESS_BLOCKED_ASNS":        "AS7922,AS123",
+		"EGRESS_BLOCKED_ISPS":        "example cable,bad transit",
+		"EGRESS_PROBE_TIMEOUT_SEC":   "9.5",
+		"TURNSTILE_INJECT_FALLBACK":  "1",
+		"TURNSTILE_INJECT_AFTER_SEC": "42",
+		"SIGNUP_MAX_ATTEMPTS":        "3",
+	})
+	if cfg.RegisterMode != "camoufox" || !cfg.EgressStrict || !cfg.EgressRejectHosting {
+		t.Fatalf("unexpected browser/egress config: %+v", cfg)
+	}
+	if cfg.EgressProbeTimeout != 9.5 || cfg.EgressBlockedASNs == "" || cfg.EgressBlockedISPs == "" {
+		t.Fatalf("unexpected egress policy: %+v", cfg)
+	}
+	if !cfg.TurnstileInjectFallback || cfg.TurnstileInjectAfterSec != 42 || cfg.SignupMaxAttempts != 3 {
+		t.Fatalf("unexpected retry/turnstile config: %+v", cfg)
+	}
+}
+
 func TestOutlookConfigAliasesAndLimits(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"outlook", "hotmail", "microsoft", "ms"} {
@@ -56,5 +80,38 @@ func TestOutlookConfigAliasesAndLimits(t *testing.T) {
 		if cfg.OutlookAccountsFile != "/secure/accounts.txt" || cfg.OutlookStateFile != "/secure/state.json" {
 			t.Fatalf("paths not loaded for %q: %+v", mode, cfg)
 		}
+	}
+}
+
+func TestInvalidGrantFallbackAndWebshareConfig(t *testing.T) {
+	cfg := Defaults()
+	applyMap(&cfg, map[string]string{
+		"EMAIL_INVALID_GRANT_FALLBACK":  "Outlook",
+		"INVALID_GRANT_STATE_FILE":      "/secure/invalid-grants.json",
+		"REGISTER_PROXY_PROVIDER":       "WebShare",
+		"WEBSHARE_PROXY_TEMPLATE":       "http://user-{session}:pass@p.webshare.io:80",
+		"WEBSHARE_MAX_SESSION_ATTEMPTS": "12",
+	})
+	if cfg.EmailInvalidGrantFallback != "outlook" {
+		t.Fatalf("EmailInvalidGrantFallback = %q", cfg.EmailInvalidGrantFallback)
+	}
+	if cfg.InvalidGrantStateFile != "/secure/invalid-grants.json" {
+		t.Fatalf("InvalidGrantStateFile = %q", cfg.InvalidGrantStateFile)
+	}
+	if cfg.RegisterProxyProvider != "webshare" || cfg.WebshareMaxSessionAttempts != 12 {
+		t.Fatalf("unexpected Webshare config: %+v", cfg)
+	}
+	if cfg.WebshareProxyTemplate != "http://user-{session}:pass@p.webshare.io:80" {
+		t.Fatalf("WebshareProxyTemplate = %q", cfg.WebshareProxyTemplate)
+	}
+}
+
+func TestWebshareTemplateSelectsProviderImplicitly(t *testing.T) {
+	cfg := Defaults()
+	applyMap(&cfg, map[string]string{
+		"WEBSHARE_PROXY_TEMPLATE": "http://user-{session}:pass@p.webshare.io:80",
+	})
+	if cfg.RegisterProxyProvider != "webshare" {
+		t.Fatalf("RegisterProxyProvider = %q", cfg.RegisterProxyProvider)
 	}
 }

@@ -75,6 +75,7 @@ func cmdTestEmail(args []string) error {
 	defer stop()
 	result, err := pipeline.RunSingleEmail(ctx, pipeline.SingleEmailOptions{
 		Cfg:      cfg,
+		Paths:    p,
 		Run:      run,
 		Email:    parsed.Email,
 		ReadCode: terminalCodeReader(os.Stdin, os.Stdout),

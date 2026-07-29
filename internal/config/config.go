@@ -34,23 +34,43 @@ type Config struct {
 	OutlookStateFile         string
 	OutlookAliasesPerAccount int
 	OutlookPollIntervalSec   float64
+	// EmailInvalidGrantFallback switches future allocations to Outlook after a
+	// domain mailbox receives OAuth invalid_grant. Empty disables failover.
+	EmailInvalidGrantFallback string
+	InvalidGrantStateFile     string
 
 	ClearanceEnabled bool
 	RegisterProxy    string
 	// RegisterProxies is a comma/newline list of HTTP proxies for rotation.
 	// When set, browser signup picks the next healthy proxy per attempt.
 	RegisterProxies string
-	FlareSolverrURL string
-	ClearanceProxy  string
-	ClearanceURLs   string
+	// RegisterProxyProvider is "static" or "webshare". Webshare uses a proxy
+	// URL template containing {session} to keep one residential exit per account.
+	RegisterProxyProvider      string
+	WebshareProxyTemplate      string
+	WebshareMaxSessionAttempts int
+	// EgressStrict requires a Cloudflare-visible public exit IP before a browser
+	// attempt. Optional ASN/ISP policies reject known-bad exits before signup.
+	EgressStrict        bool
+	EgressRejectHosting bool
+	EgressBlockedASNs   string
+	EgressBlockedISPs   string
+	EgressProbeTimeout  float64
+	FlareSolverrURL     string
+	ClearanceProxy      string
+	ClearanceURLs       string
 
 	Target      int
 	PhysicalCap int
 
 	TurnstileProvider string
 	LiteSolverURL     string
+	// Explicit Turnstile injection is riskier than the page's managed widget and
+	// is disabled by default. When enabled it is used only after this grace time.
+	TurnstileInjectFallback bool
+	TurnstileInjectAfterSec float64
 
-	// RegisterMode: browser (CloakBrowser), browser-mcp (real user Chrome), or http (legacy).
+	// RegisterMode: browser (CloakBrowser), camoufox, browser-mcp, or http (legacy).
 	RegisterMode string
 	// BrowserMCPCommand is the browser-mcp JSONL CLI executable. Incognito keeps
 	// cleanup scoped away from the normal profile; the driver also clears the
@@ -73,6 +93,7 @@ type Config struct {
 	OAuthConfirmMode        string
 	OAuthBrowserTimeoutSec  float64
 	SignupBrowserTimeoutSec float64
+	SignupMaxAttempts       int
 	// Browser signup pacing: min gap between attempts; longer after rate-limit.
 	SignupMinIntervalSec      float64
 	SignupRateLimitBackoffSec float64
@@ -95,49 +116,56 @@ type Config struct {
 
 func Defaults() Config {
 	return Config{
-		EmailMode:                 EmailTempmail,
-		EmailAPI:                  "http://127.0.0.1:8080",
-		CFTempEmailPrefix:         true,
-		OutlookAliasesPerAccount:  5,
-		OutlookPollIntervalSec:    5,
-		ClearanceEnabled:          true,
-		RegisterProxy:             "http://127.0.0.1:40080",
-		FlareSolverrURL:           "http://127.0.0.1:8191",
-		ClearanceProxy:            "http://privoxy:8118",
-		ClearanceURLs:             "https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai",
-		Target:                    10,
-		PhysicalCap:               0,
-		TurnstileProvider:         "browser",
-		LiteSolverURL:             "http://127.0.0.1:5072",
-		RegisterMode:              "browser",
-		BrowserMCPCommand:         "browser-mcp-cli",
-		BrowserMCPIncognito:       true,
-		ProtocolHTTP:              true,
-		HTTPPoolSize:              8,
-		TempmailLOLRetries:        30,
-		TempmailLOLIntervalMS:     1500,
-		OAuthWorkers:              1,
-		OAuthMinIntervalSec:       15,
-		OAuthRetrySec:             60,
-		OAuthFlowRetries:          0,
-		OAuthRetryDelaySec:        30,
-		OAuthInvalidGrantLimit:    3,
-		OAuthConfirmMode:          "browser",
-		OAuthBrowserTimeoutSec:    150,
-		SignupBrowserTimeoutSec:   180,
-		SignupMinIntervalSec:      35,
-		SignupRateLimitBackoffSec: 90,
-		ProbeEnabled:              true,
-		HTTPProxy:                 "http://127.0.0.1:40080",
-		HTTPSProxy:                "http://127.0.0.1:40080",
-		NoProxy:                   "127.0.0.1,localhost",
-		CPAUploadEnabled:          false,
-		CPAManagementBase:         "http://localhost:8317/v0/management",
-		CPAUploadTimeoutSec:       30,
-		CPAUploadRetries:          2,
-		CPAUploadNameTemplate:     "{email}.json",
-		CPAUploadVerify:           true,
-		CPAUploadMode:             "multipart",
+		EmailMode:                  EmailTempmail,
+		EmailAPI:                   "http://127.0.0.1:8080",
+		CFTempEmailPrefix:          true,
+		OutlookAliasesPerAccount:   5,
+		OutlookPollIntervalSec:     5,
+		RegisterProxyProvider:      "static",
+		WebshareMaxSessionAttempts: 8,
+		ClearanceEnabled:           true,
+		RegisterProxy:              "http://127.0.0.1:40080",
+		EgressStrict:               true,
+		EgressProbeTimeout:         12,
+		FlareSolverrURL:            "http://127.0.0.1:8191",
+		ClearanceProxy:             "http://privoxy:8118",
+		ClearanceURLs:              "https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai",
+		Target:                     10,
+		PhysicalCap:                0,
+		TurnstileProvider:          "browser",
+		LiteSolverURL:              "http://127.0.0.1:5072",
+		TurnstileInjectFallback:    false,
+		TurnstileInjectAfterSec:    35,
+		RegisterMode:               "browser",
+		BrowserMCPCommand:          "browser-mcp-cli",
+		BrowserMCPIncognito:        true,
+		ProtocolHTTP:               true,
+		HTTPPoolSize:               8,
+		TempmailLOLRetries:         30,
+		TempmailLOLIntervalMS:      1500,
+		OAuthWorkers:               1,
+		OAuthMinIntervalSec:        15,
+		OAuthRetrySec:              60,
+		OAuthFlowRetries:           0,
+		OAuthRetryDelaySec:         30,
+		OAuthInvalidGrantLimit:     3,
+		OAuthConfirmMode:           "browser",
+		OAuthBrowserTimeoutSec:     150,
+		SignupBrowserTimeoutSec:    180,
+		SignupMaxAttempts:          2,
+		SignupMinIntervalSec:       35,
+		SignupRateLimitBackoffSec:  90,
+		ProbeEnabled:               true,
+		HTTPProxy:                  "http://127.0.0.1:40080",
+		HTTPSProxy:                 "http://127.0.0.1:40080",
+		NoProxy:                    "127.0.0.1,localhost",
+		CPAUploadEnabled:           false,
+		CPAManagementBase:          "http://localhost:8317/v0/management",
+		CPAUploadTimeoutSec:        30,
+		CPAUploadRetries:           2,
+		CPAUploadNameTemplate:      "{email}.json",
+		CPAUploadVerify:            true,
+		CPAUploadMode:              "multipart",
 	}
 }
 
@@ -180,9 +208,23 @@ func Save(path string, cfg Config) error {
 	}
 	b.WriteString(fmt.Sprintf("OUTLOOK_ALIASES_PER_ACCOUNT=%d\n", cfg.OutlookAliasesPerAccount))
 	b.WriteString(fmt.Sprintf("OUTLOOK_POLL_INTERVAL_SEC=%g\n", cfg.OutlookPollIntervalSec))
+	b.WriteString(fmt.Sprintf("EMAIL_INVALID_GRANT_FALLBACK=%s\n", cfg.EmailInvalidGrantFallback))
+	if cfg.InvalidGrantStateFile != "" {
+		b.WriteString(fmt.Sprintf("INVALID_GRANT_STATE_FILE=%s\n", cfg.InvalidGrantStateFile))
+	}
 	b.WriteString(fmt.Sprintf("CLEARANCE_ENABLED=%s\n", bool01(cfg.ClearanceEnabled)))
 	b.WriteString(fmt.Sprintf("REGISTER_PROXY=%s\n", cfg.RegisterProxy))
 	b.WriteString(fmt.Sprintf("REGISTER_PROXIES=%s\n", cfg.RegisterProxies))
+	b.WriteString(fmt.Sprintf("REGISTER_PROXY_PROVIDER=%s\n", cfg.RegisterProxyProvider))
+	if cfg.WebshareProxyTemplate != "" {
+		b.WriteString(fmt.Sprintf("WEBSHARE_PROXY_TEMPLATE=%s\n", cfg.WebshareProxyTemplate))
+	}
+	b.WriteString(fmt.Sprintf("WEBSHARE_MAX_SESSION_ATTEMPTS=%d\n", cfg.WebshareMaxSessionAttempts))
+	b.WriteString(fmt.Sprintf("EGRESS_STRICT=%s\n", bool01(cfg.EgressStrict)))
+	b.WriteString(fmt.Sprintf("EGRESS_REJECT_HOSTING=%s\n", bool01(cfg.EgressRejectHosting)))
+	b.WriteString(fmt.Sprintf("EGRESS_BLOCKED_ASNS=%s\n", cfg.EgressBlockedASNs))
+	b.WriteString(fmt.Sprintf("EGRESS_BLOCKED_ISPS=%s\n", cfg.EgressBlockedISPs))
+	b.WriteString(fmt.Sprintf("EGRESS_PROBE_TIMEOUT_SEC=%g\n", cfg.EgressProbeTimeout))
 	b.WriteString(fmt.Sprintf("FLARESOLVERR_URL=%s\n", cfg.FlareSolverrURL))
 	b.WriteString(fmt.Sprintf("CLEARANCE_PROXY=%s\n", cfg.ClearanceProxy))
 	b.WriteString(fmt.Sprintf("CLEARANCE_URLS=%s\n", cfg.ClearanceURLs))
@@ -190,6 +232,8 @@ func Save(path string, cfg Config) error {
 	if cfg.LiteSolverURL != "" {
 		b.WriteString(fmt.Sprintf("LITE_SOLVER_URL=%s\n", cfg.LiteSolverURL))
 	}
+	b.WriteString(fmt.Sprintf("TURNSTILE_INJECT_FALLBACK=%s\n", bool01(cfg.TurnstileInjectFallback)))
+	b.WriteString(fmt.Sprintf("TURNSTILE_INJECT_AFTER_SEC=%g\n", cfg.TurnstileInjectAfterSec))
 	b.WriteString(fmt.Sprintf("REGISTER_MODE=%s\n", cfg.RegisterMode))
 	b.WriteString(fmt.Sprintf("BROWSER_MCP_CLI=%s\n", cfg.BrowserMCPCommand))
 	b.WriteString(fmt.Sprintf("BROWSER_MCP_INCOGNITO=%s\n", bool01(cfg.BrowserMCPIncognito)))
@@ -206,6 +250,7 @@ func Save(path string, cfg Config) error {
 	b.WriteString(fmt.Sprintf("OAUTH_CONFIRM_MODE=%s\n", cfg.OAuthConfirmMode))
 	b.WriteString(fmt.Sprintf("OAUTH_BROWSER_TIMEOUT_SEC=%g\n", cfg.OAuthBrowserTimeoutSec))
 	b.WriteString(fmt.Sprintf("SIGNUP_BROWSER_TIMEOUT_SEC=%g\n", cfg.SignupBrowserTimeoutSec))
+	b.WriteString(fmt.Sprintf("SIGNUP_MAX_ATTEMPTS=%d\n", cfg.SignupMaxAttempts))
 	b.WriteString(fmt.Sprintf("SIGNUP_MIN_INTERVAL_SEC=%g\n", cfg.SignupMinIntervalSec))
 	b.WriteString(fmt.Sprintf("SIGNUP_RATE_LIMIT_BACKOFF_SEC=%g\n", cfg.SignupRateLimitBackoffSec))
 	b.WriteString(fmt.Sprintf("HTTPS_PROXY=%s\n", cfg.HTTPSProxy))
@@ -360,6 +405,12 @@ func applyMap(cfg *Config, env map[string]string) {
 			cfg.OutlookPollIntervalSec = n
 		}
 	}
+	if v, ok := env["EMAIL_INVALID_GRANT_FALLBACK"]; ok {
+		cfg.EmailInvalidGrantFallback = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v, ok := env["INVALID_GRANT_STATE_FILE"]; ok {
+		cfg.InvalidGrantStateFile = strings.TrimSpace(v)
+	}
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)
 	}
@@ -368,6 +419,37 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["REGISTER_PROXIES"]; ok {
 		cfg.RegisterProxies = v
+	}
+	if v, ok := env["REGISTER_PROXY_PROVIDER"]; ok {
+		cfg.RegisterProxyProvider = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v, ok := env["WEBSHARE_PROXY_TEMPLATE"]; ok {
+		cfg.WebshareProxyTemplate = strings.TrimSpace(v)
+		if _, explicit := env["REGISTER_PROXY_PROVIDER"]; !explicit && cfg.WebshareProxyTemplate != "" {
+			cfg.RegisterProxyProvider = "webshare"
+		}
+	}
+	if v, ok := env["WEBSHARE_MAX_SESSION_ATTEMPTS"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 30 {
+			cfg.WebshareMaxSessionAttempts = n
+		}
+	}
+	if v, ok := env["EGRESS_STRICT"]; ok {
+		cfg.EgressStrict = truthy(v)
+	}
+	if v, ok := env["EGRESS_REJECT_HOSTING"]; ok {
+		cfg.EgressRejectHosting = truthy(v)
+	}
+	if v, ok := env["EGRESS_BLOCKED_ASNS"]; ok {
+		cfg.EgressBlockedASNs = strings.TrimSpace(v)
+	}
+	if v, ok := env["EGRESS_BLOCKED_ISPS"]; ok {
+		cfg.EgressBlockedISPs = strings.TrimSpace(v)
+	}
+	if v, ok := env["EGRESS_PROBE_TIMEOUT_SEC"]; ok {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
+			cfg.EgressProbeTimeout = n
+		}
 	}
 	if v, ok := env["FLARESOLVERR_URL"]; ok {
 		cfg.FlareSolverrURL = v
@@ -384,11 +466,21 @@ func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["LITE_SOLVER_URL"]; ok {
 		cfg.LiteSolverURL = v
 	}
+	if v, ok := env["TURNSTILE_INJECT_FALLBACK"]; ok {
+		cfg.TurnstileInjectFallback = truthy(v)
+	}
+	if v, ok := env["TURNSTILE_INJECT_AFTER_SEC"]; ok {
+		if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 5 {
+			cfg.TurnstileInjectAfterSec = n
+		}
+	}
 	if v, ok := env["REGISTER_MODE"]; ok {
 		mode := strings.ToLower(strings.TrimSpace(v))
 		switch mode {
 		case "browser", "ui", "web":
 			cfg.RegisterMode = "browser"
+		case "camoufox", "camou", "firefox-stealth", "stealth-firefox":
+			cfg.RegisterMode = "camoufox"
 		case "browser-mcp", "browser_mcp", "mcp", "real-browser", "real_chrome":
 			cfg.RegisterMode = "browser-mcp"
 		case "http", "protocol", "api", "legacy":
@@ -466,6 +558,11 @@ func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["SIGNUP_BROWSER_TIMEOUT_SEC"]; ok {
 		if n, err := strconv.ParseFloat(v, 64); err == nil {
 			cfg.SignupBrowserTimeoutSec = n
+		}
+	}
+	if v, ok := env["SIGNUP_MAX_ATTEMPTS"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 4 {
+			cfg.SignupMaxAttempts = n
 		}
 	}
 	if v, ok := env["SIGNUP_MIN_INTERVAL_SEC"]; ok {

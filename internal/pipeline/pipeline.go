@@ -18,6 +18,7 @@ import (
 	"github.com/grok-free-register/grok-reg/internal/clearance"
 	"github.com/grok-free-register/grok-reg/internal/config"
 	"github.com/grok-free-register/grok-reg/internal/cpa"
+	"github.com/grok-free-register/grok-reg/internal/egress"
 	"github.com/grok-free-register/grok-reg/internal/email"
 	"github.com/grok-free-register/grok-reg/internal/home"
 	"github.com/grok-free-register/grok-reg/internal/inventory"
@@ -25,6 +26,7 @@ import (
 	"github.com/grok-free-register/grok-reg/internal/oauth"
 	"github.com/grok-free-register/grok-reg/internal/protocol"
 	"github.com/grok-free-register/grok-reg/internal/proxypool"
+	"github.com/grok-free-register/grok-reg/internal/riskstate"
 	"github.com/grok-free-register/grok-reg/internal/signup"
 	"github.com/grok-free-register/grok-reg/internal/state"
 	"github.com/grok-free-register/grok-reg/internal/turnstile"
@@ -40,8 +42,10 @@ type AccountUploadStatus struct {
 }
 
 type AccountSession struct {
-	DiagnosticID string
-	Proxy        string
+	DiagnosticID  string
+	Proxy         string
+	Egress        egress.Profile
+	SignupAttempt int
 
 	Email    string
 	Password string
@@ -60,6 +64,17 @@ type QItem struct {
 
 type SSOJob struct {
 	Session *AccountSession
+}
+
+type oauthPollResult struct {
+	cred oauth.Credential
+	err  error
+}
+
+type browserRegistration struct {
+	result     signup.BrowserResult
+	pollCh     <-chan oauthPollResult
+	cancelPoll context.CancelFunc
 }
 
 var diagnosticSequence atomic.Uint64
@@ -89,6 +104,12 @@ type Engine struct {
 	uploader *cpa.Uploader
 
 	done                    atomic.Int64
+	accountsStarted         atomic.Int64
+	signupAttempts          atomic.Int64
+	signupAttemptFailures   atomic.Int64
+	firstPassRegistrations  atomic.Int64
+	retryRegistrations      atomic.Int64
+	registrationN           atomic.Int64
 	ssoN                    atomic.Int64
 	oaN                     atomic.Int64
 	fail                    atomic.Int64
@@ -99,6 +120,7 @@ type Engine struct {
 	// domain is retired from rotation before it drags the whole run down.
 	domainStreakMu sync.Mutex
 	domainStreak   map[string]int
+	metricsMu      sync.Mutex
 
 	start   time.Time
 	cancel  context.CancelFunc
@@ -121,7 +143,10 @@ type Engine struct {
 	completeGate     chan struct{}
 
 	// Optional multi-proxy rotation for browser signup.
-	proxies *proxypool.Pool
+	proxies         *proxypool.Pool
+	egressInspector *egress.Inspector
+	webshare        *proxypool.WebshareSessions
+	risk            *riskstate.Registry
 }
 
 func Run(ctx context.Context, opt Options) error {
@@ -159,6 +184,106 @@ func (e *Engine) nextAccountProxy() string {
 		}
 	}
 	return proxy
+}
+
+func (e *Engine) nextAccountEgress(ctx context.Context) (string, egress.Profile, error) {
+	if e.webshare != nil {
+		return e.nextWebshareEgress(ctx)
+	}
+	proxy := strings.TrimSpace(e.opt.Cfg.RegisterProxy)
+	if e.proxies == nil || e.proxies.Len() == 0 {
+		if e.egressInspector != nil {
+			profile, err := e.egressInspector.Inspect(ctx, proxy)
+			if err == nil && e.egressBlocked(profile) {
+				return "", profile, fmt.Errorf("egress IP %s is marked invalid_grant and no alternate proxy is configured", profile.IP)
+			}
+			return proxy, profile, err
+		}
+		return proxy, egress.Profile{}, nil
+	}
+	if e.egressInspector == nil {
+		for attempt := 0; attempt < e.proxies.Len(); attempt++ {
+			if selected := strings.TrimSpace(e.proxies.Next()); selected != "" {
+				proxy = selected
+			}
+			profile, _ := e.proxies.Profile(proxy)
+			if !e.egressBlocked(profile) {
+				return proxy, profile, nil
+			}
+		}
+		return "", egress.Profile{}, fmt.Errorf("all known proxy exits are marked invalid_grant")
+	}
+	maxAttempts := e.proxies.Len() * 3
+	if maxAttempts < 3 {
+		maxAttempts = 3
+	}
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		prepared, profile, err := e.proxies.Prepare(ctx)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if e.egressBlocked(profile) {
+			lastErr = fmt.Errorf("egress IP %s is marked invalid_grant", profile.IP)
+			continue
+		}
+		return strings.TrimSpace(prepared), profile, nil
+	}
+	return "", egress.Profile{}, firstError(lastErr, fmt.Errorf("no unused proxy exit available"))
+}
+
+func (e *Engine) nextWebshareEgress(ctx context.Context) (string, egress.Profile, error) {
+	if e.egressInspector == nil {
+		return "", egress.Profile{}, fmt.Errorf("Webshare requires strict egress inspection")
+	}
+	maxAttempts := e.opt.Cfg.WebshareMaxSessionAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 8
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		proxyURL, _, err := e.webshare.Next()
+		if err != nil {
+			return "", egress.Profile{}, err
+		}
+		candidate := proxypool.New(proxypool.Options{
+			Proxies:      []string{proxyURL},
+			ProbeTimeout: time.Duration(e.opt.Cfg.EgressProbeTimeout * float64(time.Second)),
+			Inspector:    e.egressInspector,
+		})
+		_, first, err := candidate.Prepare(ctx)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		second, err := e.egressInspector.Inspect(ctx, proxyURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if first.IP == "" || second.IP == "" || first.IP != second.IP {
+			lastErr = fmt.Errorf("Webshare session is not sticky: first=%s second=%s", first.IP, second.IP)
+			continue
+		}
+		if e.egressBlocked(second) {
+			lastErr = fmt.Errorf("Webshare exit IP %s is marked invalid_grant", second.IP)
+			continue
+		}
+		return proxyURL, second, nil
+	}
+	return "", egress.Profile{}, firstError(lastErr, fmt.Errorf("Webshare could not provide a new sticky residential IP"))
+}
+
+func (e *Engine) egressBlocked(profile egress.Profile) bool {
+	return e.risk != nil && profile.IP != "" && e.risk.IPBlocked(profile.IP)
+}
+
+func firstError(err, fallback error) error {
+	if err != nil {
+		return err
+	}
+	return fallback
 }
 
 func (e *Engine) buildOAuthClient(session *AccountSession) (*oauth.Client, error) {
@@ -294,6 +419,81 @@ func (e *Engine) noteOAuthRateResult(err error) {
 // futile standalone retries that followed reset it each time.
 func (e *Engine) noteOAuthOutcome(err error) {
 	e.noteOAuthOutcomeFor("", err)
+}
+
+// noteOAuthOutcomeForSession adds account-scoped recovery before the run-wide
+// breaker: persist the rejected mailbox/IP pair, switch domain mail to Outlook,
+// and make the next account obtain a different proxy exit.
+func (e *Engine) noteOAuthOutcomeForSession(session *AccountSession, err error) {
+	if session == nil {
+		e.noteOAuthOutcomeFor("", err)
+		return
+	}
+	if oauth.IsInvalidGrant(err) {
+		if e.recordInvalidGrant(session) {
+			// The domain-mailbox rejection was handled by switching sources. Give
+			// Outlook its own breaker budget instead of stopping immediately.
+			e.oauthInvalidGrantStreak.Store(0)
+			return
+		}
+	}
+	e.noteOAuthOutcomeFor(session.Email, err)
+}
+
+func (e *Engine) recordInvalidGrant(session *AccountSession) (fallbackHandled bool) {
+	if session == nil {
+		return false
+	}
+	domainMailbox := session.Handle.Kind != "outlook"
+	if domainMailbox && e.mail != nil && e.mail.OutlookFallbackEnabled() {
+		_ = e.mail.SwitchToOutlook()
+		fallbackHandled = e.mail.UsingOutlook()
+	}
+	if e.risk != nil {
+		err := e.risk.RecordInvalidGrant(riskstate.InvalidGrantRecord{
+			DiagnosticID: session.DiagnosticID,
+			Email:        session.Email,
+			MailboxKind:  session.Handle.Kind,
+			IP:           session.Egress.IP,
+			ASN:          session.Egress.ASN,
+			ISP:          session.Egress.ISP,
+			Proxy:        proxypool.Label(session.Proxy),
+		}, fallbackHandled)
+		if err != nil && e.opt.Log != nil {
+			e.opt.Log.Warnf("保存 invalid_grant 邮箱/IP 标记失败: %v", err)
+		}
+	}
+	if e.opt.Log != nil {
+		e.opt.Log.Warnf(
+			"invalid_grant 已标记 acct=%s mailbox=%s ip=%s；下个账号强制更换邮箱和出口",
+			session.DiagnosticID,
+			session.Handle.Kind,
+			firstPresent(session.Egress.IP, "unknown"),
+		)
+		if fallbackHandled {
+			e.opt.Log.Warnf("域名邮箱已停用，后续注册切换到 Outlook 轮询池")
+		}
+	}
+	if fallbackHandled && e.opt.Store != nil {
+		_ = e.opt.Store.Set(func(s *state.Snapshot) {
+			s.Phase = state.PhaseRegister
+			s.PhaseDetail = "invalid_grant：已切换 Outlook 和新 IP"
+		})
+	}
+	return fallbackHandled
+}
+
+func (e *Engine) accountCandidateAllowed(session *AccountSession) bool {
+	if session == nil {
+		return false
+	}
+	if e.mail != nil && e.mail.UsingOutlook() && session.Handle.Kind != "outlook" {
+		return false
+	}
+	if e.risk == nil {
+		return true
+	}
+	return !e.risk.EmailBlocked(session.Email) && !e.risk.IPBlocked(session.Egress.IP)
 }
 
 // noteOAuthOutcomeFor is noteOAuthOutcome with the account's mailbox domain
@@ -474,6 +674,7 @@ func (e *Engine) run(ctx context.Context) error {
 		s.RunID = e.opt.Run.RunID
 		s.Target = e.opt.Target
 		s.Done = 0
+		s.Funnel = state.Funnel{}
 		s.Phase = state.PhaseClearance
 		s.PhaseDetail = "清障预热中"
 		s.Workers = state.Workers{S: sWorkers, P: pWorkers, C: cWorkers, OAuth: oauthWorkers}
@@ -483,6 +684,20 @@ func (e *Engine) run(ctx context.Context) error {
 		s.OutputDir = e.opt.Run.Root
 		s.Error = ""
 	})
+
+	riskPath := strings.TrimSpace(cfg.InvalidGrantStateFile)
+	if riskPath == "" {
+		riskPath = e.opt.Paths.InvalidGrantState
+	}
+	var err error
+	e.risk, err = riskstate.Open(riskPath)
+	if err != nil {
+		return err
+	}
+	blockedEmails, blockedIPs, invalidRecords := e.risk.Counts()
+	if invalidRecords > 0 {
+		log.Infof("invalid_grant state loaded emails=%d ips=%d records=%d path=%s", blockedEmails, blockedIPs, invalidRecords, riskPath)
+	}
 
 	// Clearance
 	if cfg.ClearanceEnabled {
@@ -497,30 +712,64 @@ func (e *Engine) run(ctx context.Context) error {
 		log.Info("[clearance] 未启用")
 	}
 
-	// Build register proxy pool: REGISTER_PROXIES (+ REGISTER_PROXY as fallback entry).
+	proxyProvider := strings.ToLower(strings.TrimSpace(cfg.RegisterProxyProvider))
+	if proxyProvider == "" {
+		proxyProvider = "static"
+	}
+	if proxyProvider != "static" && proxyProvider != "webshare" {
+		return fmt.Errorf("unsupported REGISTER_PROXY_PROVIDER=%s", proxyProvider)
+	}
+	if proxyProvider == "webshare" {
+		if !isBrowserRegisterMode(regMode) || regMode == "browser-mcp" {
+			return fmt.Errorf("Webshare account sessions require REGISTER_MODE=browser or camoufox")
+		}
+		e.webshare, err = proxypool.NewWebshareSessions(cfg.WebshareProxyTemplate)
+		if err != nil {
+			return err
+		}
+		log.Infof("[proxy] provider=webshare endpoint=%s per-account sticky sessions enabled", e.webshare.Label())
+	}
+
 	proxyList := proxypool.ParseList(cfg.RegisterProxies)
-	if strings.EqualFold(strings.TrimSpace(cfg.RegisterMode), "browser-mcp") && len(proxyList) > 1 {
-		log.Warnf("[proxy] browser-mcp controls an existing Chrome network and cannot rotate per-tab proxies; REGISTER_PROXIES rotation is disabled for this mode")
+	if proxyProvider == "webshare" {
 		proxyList = nil
+	} else {
+		if strings.EqualFold(strings.TrimSpace(cfg.RegisterMode), "browser-mcp") && len(proxyList) > 1 {
+			log.Warnf("[proxy] browser-mcp controls an existing Chrome network and cannot rotate per-tab proxies; REGISTER_PROXIES rotation is disabled for this mode")
+			proxyList = nil
+		}
+		if len(proxyList) == 0 && strings.TrimSpace(cfg.RegisterProxy) != "" {
+			proxyList = []string{cfg.RegisterProxy}
+		}
 	}
-	if len(proxyList) == 0 && strings.TrimSpace(cfg.RegisterProxy) != "" {
-		// No pool configured — single REGISTER_PROXY only.
-		proxyList = []string{cfg.RegisterProxy}
+	var egressInspector *egress.Inspector
+	if (cfg.EgressStrict || proxyProvider == "webshare") && !strings.EqualFold(strings.TrimSpace(cfg.RegisterMode), "browser-mcp") {
+		egressInspector = egress.NewInspector(egress.Options{
+			Timeout:       time.Duration(cfg.EgressProbeTimeout * float64(time.Second)),
+			BlockedASNs:   cfg.EgressBlockedASNs,
+			BlockedISPs:   cfg.EgressBlockedISPs,
+			RejectHosting: cfg.EgressRejectHosting,
+		})
 	}
-	// When REGISTER_PROXIES is set, it is the full rotation list (do NOT silently
-	// append REGISTER_PROXY, which used to drag a third gateway back into the pool).
-	e.proxies = proxypool.New(proxypool.Options{
-		Proxies:      proxyList,
-		ProbeTimeout: 12 * time.Second,
-		Cooldown:     12 * time.Minute,
-		Logf: func(f string, a ...any) {
-			log.Infof("[proxy] "+f, a...)
-		},
-	})
+	e.egressInspector = egressInspector
+	if proxyProvider == "static" {
+		e.proxies = proxypool.New(proxypool.Options{
+			Proxies:      proxyList,
+			ProbeTimeout: time.Duration(cfg.EgressProbeTimeout * float64(time.Second)),
+			Cooldown:     12 * time.Minute,
+			Inspector:    egressInspector,
+			Logf: func(f string, a ...any) {
+				log.Infof("[proxy] "+f, a...)
+			},
+		})
+	}
 	if e.proxies != nil && e.proxies.Len() > 0 {
 		live := e.proxies.ProbeAll(ctx)
 		log.Infof("[proxy] pool size=%d live=%d | %s", e.proxies.Len(), live, e.proxies.Snapshot())
 		if live == 0 {
+			if cfg.EgressStrict && egressInspector != nil {
+				return fmt.Errorf("no proxy passed strict egress/Cloudflare preflight")
+			}
 			log.Warnf("[proxy] no proxy passed accounts.x.ai probe — will still try (browser may differ from curl)")
 		}
 		// Prefer a live proxy as the default for non-rotating clients.
@@ -530,7 +779,6 @@ func (e *Engine) run(ctx context.Context) error {
 		}
 	}
 
-	var err error
 	e.xai, err = protocol.NewClient(cfg.RegisterProxy, e.cm)
 	if err != nil {
 		return err
@@ -542,6 +790,9 @@ func (e *Engine) run(ctx context.Context) error {
 	outlookStateFile := strings.TrimSpace(cfg.OutlookStateFile)
 	if outlookStateFile == "" {
 		outlookStateFile = e.opt.Paths.OutlookState
+	}
+	if fallback := strings.ToLower(strings.TrimSpace(cfg.EmailInvalidGrantFallback)); fallback != "" && fallback != "outlook" {
+		return fmt.Errorf("unsupported EMAIL_INVALID_GRANT_FALLBACK=%s", fallback)
 	}
 	e.mail = email.New(email.Config{
 		Mode:                     cfg.EmailMode,
@@ -558,17 +809,29 @@ func (e *Engine) run(ctx context.Context) error {
 		OutlookStateFile:         outlookStateFile,
 		OutlookAliasesPerAccount: cfg.OutlookAliasesPerAccount,
 		OutlookPollInterval:      time.Duration(cfg.OutlookPollIntervalSec * float64(time.Second)),
+		InvalidGrantFallback:     cfg.EmailInvalidGrantFallback,
 	})
 	if err := e.mail.Validate(); err != nil {
 		return fmt.Errorf("邮箱配置: %w", err)
 	}
 	if remaining, ok := e.mail.OutlookRemaining(); ok {
-		if remaining < e.opt.Target {
+		if cfg.EmailMode == config.EmailOutlook && remaining < e.opt.Target {
 			return fmt.Errorf("Outlook 别名池只剩 %d 个地址，少于本次目标 %d；请导入更多主邮箱或提高 OUTLOOK_ALIASES_PER_ACCOUNT", remaining, e.opt.Target)
 		}
-		if remaining < e.opt.Target+2 {
-			log.Warnf("Outlook 别名池剩余 %d、目标 %d，几乎没有失败重试余量", remaining, e.opt.Target)
+		if e.mail.OutlookFallbackEnabled() && remaining < 1 {
+			return fmt.Errorf("Outlook fallback 已启用，但别名池没有可用地址")
 		}
+		if cfg.EmailMode == config.EmailOutlook && remaining < e.opt.Target+2 {
+			log.Warnf("Outlook 别名池剩余 %d、目标 %d，几乎没有失败重试余量", remaining, e.opt.Target)
+		} else if e.mail.OutlookFallbackEnabled() {
+			log.Infof("Email invalid_grant fallback=outlook remaining_aliases=%d", remaining)
+		}
+	}
+	if e.risk.FallbackToOutlook() && e.mail.OutlookFallbackEnabled() {
+		if !e.mail.UsingOutlook() && !e.mail.SwitchToOutlook() {
+			return fmt.Errorf("invalid_grant state requires Outlook fallback, but no Outlook alias is available")
+		}
+		log.Warnf("根据持久化 invalid_grant 标记，本轮从 Outlook 邮箱池开始")
 	}
 	if cfg.EmailMode == config.EmailCFTemp {
 		pool := e.mail.CFTempDomainPool()
@@ -599,15 +862,22 @@ func (e *Engine) run(ctx context.Context) error {
 	if regMode == "" {
 		regMode = "browser"
 	}
+	browserOptions := signup.BrowserOptions{
+		Proxy:                   cfg.RegisterProxy,
+		Timeout:                 time.Duration(cfg.SignupBrowserTimeoutSec * float64(time.Second)),
+		CodeTimeout:             100 * time.Second,
+		DiagnosticDir:           filepath.Join(e.opt.Run.Root, "signup-browser"),
+		TurnstileInjectFallback: cfg.TurnstileInjectFallback,
+		TurnstileInjectAfter:    time.Duration(cfg.TurnstileInjectAfterSec * float64(time.Second)),
+		Tracef:                  log.Infof,
+	}
 	if regMode == "browser" {
-		e.signup = signup.NewBrowser(signup.BrowserOptions{
-			Proxy:         cfg.RegisterProxy,
-			Timeout:       time.Duration(cfg.SignupBrowserTimeoutSec * float64(time.Second)),
-			CodeTimeout:   100 * time.Second,
-			DiagnosticDir: filepath.Join(e.opt.Run.Root, "signup-browser"),
-			Tracef:        log.Infof,
-		})
+		e.signup = signup.NewBrowser(browserOptions)
 		log.Infof("Register mode=browser script=%s (Castle+Turnstile in-page)", signup.DetectedScript())
+	} else if regMode == "camoufox" {
+		browserOptions.DiagnosticDir = filepath.Join(e.opt.Run.Root, "signup-camoufox")
+		e.signup = signup.NewCamoufoxBrowser(browserOptions)
+		log.Infof("Register mode=camoufox script=%s (BrowserForge+GeoIP+WebRTC protection)", signup.DetectedScript())
 	} else if regMode == "browser-mcp" {
 		workingDir, _ := os.Getwd()
 		e.signup = signup.NewMCPBrowser(signup.MCPBrowserOptions{
@@ -773,6 +1043,7 @@ shutdown:
 		s.SSOCount = int(e.ssoN.Load())
 		s.OAuthCount = int(e.oaN.Load())
 		s.FailCount = int(e.fail.Load())
+		s.Funnel = e.funnelSnapshot()
 		s.PID = 0
 	})
 	log.Infof("结束 done=%d sso=%d oauth=%d fail=%d", e.done.Load(), e.ssoN.Load(), e.oaN.Load(), e.fail.Load())
@@ -791,6 +1062,7 @@ func (e *Engine) refreshState() {
 		s.SSOCount = int(e.ssoN.Load())
 		s.OAuthCount = int(e.oaN.Load())
 		s.FailCount = int(e.fail.Load())
+		s.Funnel = e.funnelSnapshot()
 		s.RatePerMin = rate
 		if s.Phase == state.PhaseRegister || s.Phase == "" {
 			s.PhaseDetail = fmt.Sprintf("注册中 T=%d Q=%d done=%d/%d", t, q, e.done.Load(), e.opt.Target)
@@ -895,6 +1167,12 @@ func (e *Engine) pWorker(ctx context.Context, id int) {
 			continue
 		}
 		session := newAccountSession(h, e.opt.Cfg.RegisterProxy)
+		if !e.accountCandidateAllowed(session) {
+			e.mail.Release(h)
+			e.qPending.Release()
+			log.Warnf("[P%d] skipped marked/stale mailbox %s", id, session.Email)
+			continue
+		}
 		if err := e.xai.CreateEmailCode(session.Email); err != nil {
 			e.mail.Release(h)
 			e.qPending.Release()
@@ -942,6 +1220,16 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			e.fail.Add(1)
 			continue
 		}
+		if !e.accountCandidateAllowed(session) {
+			e.mail.Release(session.Handle)
+			pair.Release()
+			log.Warnf("[C%d] discarded staged mailbox/IP after invalid_grant switch acct=%s", id, session.DiagnosticID)
+			continue
+		}
+		e.accountsStarted.Add(1)
+		e.signupAttempts.Add(1)
+		session.SignupAttempt = 1
+		e.recordRegistrationMetric(session, 1, "attempt", "started", nil)
 		_ = e.opt.Store.Set(func(s *state.Snapshot) {
 			s.Phase = state.PhaseRegister
 			s.PhaseDetail = fmt.Sprintf("正在注册 %s", session.Email)
@@ -952,6 +1240,8 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 		if err := e.xai.VerifyEmailCode(session.Email, session.Code); err != nil {
 			log.Warnf("verify fail %s acct=%s: %v", session.Email, session.DiagnosticID, err)
 			pair.Release()
+			e.signupAttemptFailures.Add(1)
+			e.recordRegistrationMetric(session, 1, "verify_email", "failure", err)
 			e.fail.Add(1)
 			continue
 		}
@@ -967,17 +1257,23 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 				preview = preview[:180]
 			}
 			log.Warnf("signup fail %s acct=%s: err=%v sso=%v body=%q", session.Email, session.DiagnosticID, err, sso != "", preview)
+			e.signupAttemptFailures.Add(1)
+			e.recordRegistrationMetric(session, 1, "registration", "failure", err)
 			e.fail.Add(1)
 			continue
 		}
 
 		session.SSO = strings.TrimSpace(sso)
+		e.registrationN.Add(1)
+		e.firstPassRegistrations.Add(1)
+		e.recordRegistrationMetric(session, 1, "registration", "success", nil)
 		accPath := filepath.Join(e.opt.Run.SSO, "accounts.txt")
 		if err := cpa.AppendSSO(accPath, session.Email, session.Password, session.SSO); err != nil {
 			log.Warnf("write sso: %v", err)
 		}
 		_ = cpa.AppendAuthSession(filepath.Join(e.opt.Run.SSO, "auth-sessions.jsonl"), session.Email, session.SSO)
 		n := e.ssoN.Add(1)
+		e.recordRegistrationMetric(session, 1, "sso", "success", nil)
 		log.OKf("注册成功 #%d %s acct=%s", n, session.Email, session.DiagnosticID)
 
 		// A brand-new SSO can briefly bounce auth.x.ai device verify back to
@@ -1034,6 +1330,7 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 		if err != nil {
 			session.closeOAuth()
 			log.Warnf("OAuth fail %s acct=%s: %v", session.Email, session.DiagnosticID, err)
+			e.recordRegistrationMetric(session, session.SignupAttempt, "oauth", "failure", err)
 			_ = cpa.AppendOAuthFailure(
 				filepath.Join(e.opt.Run.SSO, "oauth-failures.jsonl"),
 				session.Email,
@@ -1041,10 +1338,10 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 				session.DiagnosticID,
 			)
 			e.fail.Add(1)
-			e.noteOAuthOutcomeFor(session.Email, err)
+			e.noteOAuthOutcomeForSession(session, err)
 			continue
 		}
-		e.noteOAuthOutcomeFor(session.Email, nil)
+		e.noteOAuthOutcomeForSession(session, nil)
 		if err := e.completeAccount(ctx, session, cred, "oauth-worker"); err != nil {
 			log.Warnf("CPA finalize fail %s acct=%s: %v", session.Email, session.DiagnosticID, err)
 			e.fail.Add(1)
@@ -1082,7 +1379,7 @@ func (e *Engine) exchangeOAuthWithRetry(ctx context.Context, session *AccountSes
 		if e.proxies != nil {
 			e.proxies.ReportFailure(session.Proxy, exchangeErr)
 		}
-		if attempt >= retries || !oauth.IsRetryableRejection(exchangeErr) {
+		if oauth.IsInvalidGrant(exchangeErr) || attempt >= retries || !oauth.IsRetryableRejection(exchangeErr) {
 			break
 		}
 		e.opt.Log.Warnf("OAuth %s acct=%s: %v；%s 后用全新 Device Flow 重试 (%d/%d)", session.Email, session.DiagnosticID, exchangeErr, delay, attempt+1, retries)
@@ -1101,6 +1398,7 @@ func (e *Engine) completeAccount(ctx context.Context, session *AccountSession, c
 	}
 	defer session.closeOAuth()
 	e.oaN.Add(1)
+	e.recordRegistrationMetric(session, session.SignupAttempt, "oauth", "success", nil)
 	doc := cpa.FromCredential(cred, session.Email)
 
 	// Finalization includes synchronous upload, so serialize the target check and
@@ -1132,6 +1430,7 @@ func (e *Engine) completeAccount(ctx context.Context, session *AccountSession, c
 	if e.opt.Cfg.ProbeEnabled {
 		if err := cpa.ProbeContext(ctx, doc, session.Proxy); err != nil {
 			_, _ = cpa.WriteAtomic(e.opt.Run.Discarded, doc, cpa.DefaultSecret())
+			e.recordRegistrationMetric(session, session.SignupAttempt, "cpa", "failure", err)
 			return fmt.Errorf("probe: %w", err)
 		}
 	}
@@ -1143,6 +1442,7 @@ func (e *Engine) completeAccount(ctx context.Context, session *AccountSession, c
 	}
 	path, err := cpa.WriteAtomic(e.opt.Run.CPA, doc, cpa.DefaultSecret())
 	if err != nil {
+		e.recordRegistrationMetric(session, session.SignupAttempt, "cpa", "failure", err)
 		return fmt.Errorf("write CPA: %w", err)
 	}
 	if e.uploader != nil && e.uploader.Enabled() {
@@ -1169,6 +1469,7 @@ func (e *Engine) completeAccount(ctx context.Context, session *AccountSession, c
 		return err
 	}
 	done := e.done.Add(1)
+	e.recordRegistrationMetric(session, session.SignupAttempt, "cpa", "success", nil)
 	e.opt.Log.OKf("OAuth/CPA 完成 #%d/%d %s -> %s (%s acct=%s)", done, e.opt.Target, session.Email, filepath.Base(path), source, session.DiagnosticID)
 	e.refreshState()
 	return nil
@@ -1217,6 +1518,17 @@ func (e *Engine) pWorkerBrowser(ctx context.Context, id int) {
 		if err := e.qPending.Acquire(ctx); err != nil {
 			return
 		}
+		proxy, exitProfile, exitErr := e.nextAccountEgress(ctx)
+		if exitErr != nil {
+			e.qPending.Release()
+			log.Warnf("[P%d] no acceptable egress: %v", id, exitErr)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
 		h, err := e.mail.Create()
 		if err != nil {
 			e.qPending.Release()
@@ -1228,7 +1540,14 @@ func (e *Engine) pWorkerBrowser(ctx context.Context, id int) {
 			}
 			continue
 		}
-		session := newAccountSession(h, e.nextAccountProxy())
+		session := newAccountSession(h, proxy)
+		session.Egress = exitProfile
+		if !e.accountCandidateAllowed(session) {
+			e.mail.Release(h)
+			e.qPending.Release()
+			log.Warnf("[P%d] skipped marked/stale mailbox or IP acct=%s", id, session.DiagnosticID)
+			continue
+		}
 		item := QItem{Session: session}
 		if err := e.inv.PutQ(ctx, item, 5*time.Minute); err != nil {
 			e.mail.Release(h)
@@ -1236,7 +1555,7 @@ func (e *Engine) pWorkerBrowser(ctx context.Context, id int) {
 			return
 		}
 		e.qPending.Release()
-		log.Debugf("[P%d] mailbox ready %s acct=%s proxy=%s", id, session.Email, session.DiagnosticID, proxypool.Label(session.Proxy))
+		log.Debugf("[P%d] mailbox ready %s acct=%s proxy=%s %s", id, session.Email, session.DiagnosticID, proxypool.Label(session.Proxy), session.Egress.Summary())
 	}
 }
 
@@ -1288,6 +1607,188 @@ func (e *Engine) noteSignupAttempt(rateLimited bool) {
 	e.signupPaceMu.Unlock()
 }
 
+func browserSignupRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "rate limit") ||
+		strings.Contains(message, "rate_limited") ||
+		strings.Contains(message, "too many") ||
+		strings.Contains(message, "email_code_rate_limited")
+}
+
+func firstPresent(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func browserSignupRetryable(result signup.BrowserResult, err error) bool {
+	if err == nil && result.OK {
+		return false
+	}
+	message := strings.ToLower(strings.Join([]string{result.Stage, result.Error}, " "))
+	if err != nil {
+		message += " " + strings.ToLower(err.Error())
+	}
+	// These are deterministic account/configuration outcomes. Reopening a
+	// browser cannot repair them and would only consume another email code.
+	for _, terminal := range []string{
+		"rate limit", "rate_limited", "too many", "email_code_rate_limited",
+		"email_rejected", "invalid email", "email_invalid", "invalid_or_expired_code",
+		"signup_browser_invalid", "browser_mcp_signup_invalid", "unsupported browser engine",
+		"not installed", "executable not found", "unsafe: incognito is required",
+	} {
+		if strings.Contains(message, terminal) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Engine) signupDiagnosticRoot() string {
+	switch e.signup.Name() {
+	case "browser-mcp-signup":
+		return "signup-browser-mcp"
+	case "camoufox-signup":
+		return "signup-camoufox"
+	default:
+		return "signup-browser"
+	}
+}
+
+func (e *Engine) runBrowserRegistrationAttempts(ctx context.Context, id int, session *AccountSession) (browserRegistration, error) {
+	maxAttempts := e.opt.Cfg.SignupMaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			proxy, profile, err := e.nextAccountEgress(ctx)
+			if err != nil {
+				e.recordRegistrationMetric(session, attempt, "egress", "failure", err)
+				return browserRegistration{}, fmt.Errorf("retry egress preflight: %w", err)
+			}
+			session.closeOAuth()
+			session.Proxy = proxy
+			session.Egress = profile
+		}
+		if err := e.waitSignupPace(ctx, e.opt.Log); err != nil {
+			return browserRegistration{}, err
+		}
+
+		session.SignupAttempt = attempt
+		e.signupAttempts.Add(1)
+		e.recordRegistrationMetric(session, attempt, "attempt", "started", nil)
+		if err := e.phys.Acquire(ctx); err != nil {
+			return browserRegistration{}, err
+		}
+
+		e.signup.SetProxy(session.Proxy)
+		e.signup.SetEgress(session.Egress)
+		e.signup.SetDiagnosticDir(filepath.Join(
+			e.opt.Run.Root,
+			e.signupDiagnosticRoot(),
+			session.DiagnosticID,
+			fmt.Sprintf("attempt-%d", attempt),
+		))
+		e.opt.Log.Infof(
+			"browser acct=%s attempt=%d/%d proxy=%s %s",
+			session.DiagnosticID,
+			attempt,
+			maxAttempts,
+			proxypool.Label(session.Proxy),
+			session.Egress.Summary(),
+		)
+		_ = e.opt.Store.Set(func(s *state.Snapshot) {
+			s.Phase = state.PhaseRegister
+			s.PhaseDetail = fmt.Sprintf("浏览器注册 %s @%s (%d/%d)", session.Email, proxypool.Label(session.Proxy), attempt, maxAttempts)
+		})
+
+		client, clientErr := e.oauthFor(session)
+		if clientErr != nil {
+			e.phys.Release()
+			e.signupAttemptFailures.Add(1)
+			e.recordRegistrationMetric(session, attempt, "oauth_client", "failure", clientErr)
+			return browserRegistration{}, clientErr
+		}
+
+		flow, flowErr := e.startAccountDeviceFlow(ctx, client)
+		if flowErr != nil {
+			e.phys.Release()
+			session.closeOAuth()
+			e.signupAttemptFailures.Add(1)
+			e.recordRegistrationMetric(session, attempt, "device_flow", "failure", flowErr)
+			if e.proxies != nil {
+				e.proxies.ReportFailure(session.Proxy, flowErr)
+			}
+			e.noteSignupAttempt(false)
+			lastErr = flowErr
+			if attempt < maxAttempts && browserSignupRetryable(signup.BrowserResult{Stage: "device_flow"}, flowErr) {
+				e.opt.Log.Warnf("device flow fail %s acct=%s: %v；更换出口后重试 (%d/%d)", session.Email, session.DiagnosticID, flowErr, attempt+1, maxAttempts)
+				continue
+			}
+			return browserRegistration{}, flowErr
+		}
+
+		pollCtx, cancelPoll := context.WithCancel(ctx)
+		pollCh := make(chan oauthPollResult, 1)
+		go func() {
+			cred, err := client.PollToken(pollCtx, flow)
+			pollCh <- oauthPollResult{cred: cred, err: err}
+		}()
+
+		result, regErr := e.signup.RegisterWithOAuth(ctx, session.Email, session.Password, "", "", flow.VerificationURL, func(pctx context.Context) (string, error) {
+			_ = pctx
+			return e.mail.PollCode(session.Handle, 100*time.Second)
+		})
+		e.phys.Release()
+		if regErr == nil && !result.OK {
+			regErr = fmt.Errorf("browser registration failed at %s: %s", firstPresent(result.Stage, "unknown"), firstPresent(result.Error, "no success result"))
+		}
+		if regErr != nil {
+			cancelPoll()
+			session.closeOAuth()
+			e.signupAttemptFailures.Add(1)
+			stage := firstPresent(result.Stage, "browser_register")
+			e.recordRegistrationMetric(session, attempt, stage, "failure", regErr)
+			rateLimited := browserSignupRateLimited(regErr)
+			if rateLimited {
+				e.opt.Log.Warnf("email/signup rate-limited — backoff before next account")
+			}
+			if e.proxies != nil {
+				e.proxies.ReportFailure(session.Proxy, regErr)
+			}
+			e.noteSignupAttempt(rateLimited)
+			lastErr = regErr
+			if attempt < maxAttempts && browserSignupRetryable(result, regErr) {
+				e.opt.Log.Warnf("browser signup fail %s acct=%s: %v；更换出口后重试 (%d/%d)", session.Email, session.DiagnosticID, regErr, attempt+1, maxAttempts)
+				continue
+			}
+			return browserRegistration{}, regErr
+		}
+
+		if e.proxies != nil {
+			e.proxies.ReportSuccess(session.Proxy)
+		}
+		e.noteSignupAttempt(false)
+		e.registrationN.Add(1)
+		if attempt == 1 {
+			e.firstPassRegistrations.Add(1)
+		} else {
+			e.retryRegistrations.Add(1)
+		}
+		e.recordRegistrationMetric(session, attempt, "registration", "success", nil)
+		return browserRegistration{result: result, pollCh: pollCh, cancelPoll: cancelPoll}, nil
+	}
+	return browserRegistration{}, lastErr
+}
+
 func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 	defer e.wgReg.Done()
 	log := e.opt.Log
@@ -1296,11 +1797,7 @@ func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 		return
 	}
 	for {
-		// Only OAuth/CPA completion (done) counts toward -t target.
 		if int(e.done.Load()) >= e.opt.Target {
-			return
-		}
-		if err := e.waitSignupPace(ctx, log); err != nil {
 			return
 		}
 		env, err := e.inv.ClaimQ(ctx)
@@ -1314,103 +1811,46 @@ func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 			e.fail.Add(1)
 			continue
 		}
+		if !e.accountCandidateAllowed(session) {
+			e.mail.Release(session.Handle)
+			env.Release()
+			log.Warnf("[C%d] discarded staged mailbox/IP after invalid_grant switch acct=%s", id, session.DiagnosticID)
+			continue
+		}
+		e.accountsStarted.Add(1)
+		e.recordRegistrationMetric(session, 0, "account", "started", nil)
 		_ = e.opt.Store.Set(func(s *state.Snapshot) {
 			s.Phase = state.PhaseRegister
 			s.PhaseDetail = fmt.Sprintf("浏览器注册 %s", session.Email)
 		})
 		log.Startf("开始浏览器注册 %s acct=%s", session.Email, session.DiagnosticID)
 
-		if err := e.phys.Acquire(ctx); err != nil {
-			env.Release()
-			return
-		}
-		e.signup.SetProxy(session.Proxy)
-		diagnosticRoot := "signup-browser"
-		if e.signup.Name() == "browser-mcp-signup" {
-			diagnosticRoot = "signup-browser-mcp"
-		}
-		e.signup.SetDiagnosticDir(filepath.Join(e.opt.Run.Root, diagnosticRoot, session.DiagnosticID))
-		log.Infof("browser acct=%s proxy=%s", session.DiagnosticID, proxypool.Label(session.Proxy))
-		_ = e.opt.Store.Set(func(s *state.Snapshot) {
-			s.Phase = state.PhaseRegister
-			s.PhaseDetail = fmt.Sprintf("浏览器注册 %s @%s", session.Email, proxypool.Label(session.Proxy))
-		})
-
-		client, clientErr := e.oauthFor(session)
-		if clientErr != nil {
-			e.phys.Release()
-			env.Release()
-			log.Warnf("OAuth client fail %s acct=%s: %v", session.Email, session.DiagnosticID, clientErr)
-			e.fail.Add(1)
-			e.noteSignupAttempt(false)
-			continue
-		}
-
-		// Start Device Flow first so the same browser session can approve it
-		// immediately after signup (matches manual register→OAuth continuity).
-		flow, flowErr := e.startAccountDeviceFlow(ctx, client)
-		if flowErr != nil {
-			e.phys.Release()
-			env.Release()
-			session.closeOAuth()
-			log.Warnf("device flow start fail %s acct=%s: %v", session.Email, session.DiagnosticID, flowErr)
-			if e.proxies != nil {
-				e.proxies.ReportFailure(session.Proxy, flowErr)
-			}
-			e.fail.Add(1)
-			e.noteSignupAttempt(false)
-			continue
-		}
-
-		type pollResult struct {
-			cred oauth.Credential
-			err  error
-		}
-		pollCtx, cancelPoll := context.WithCancel(ctx)
-		pollCh := make(chan pollResult, 1)
-		go func() {
-			cred, err := client.PollToken(pollCtx, flow)
-			pollCh <- pollResult{cred: cred, err: err}
-		}()
-
-		result, regErr := e.signup.RegisterWithOAuth(ctx, session.Email, session.Password, "", "", flow.VerificationURL, func(pctx context.Context) (string, error) {
-			_ = pctx
-			return e.mail.PollCode(session.Handle, 100*time.Second)
-		})
+		registration, regErr := e.runBrowserRegistrationAttempts(ctx, id, session)
 		e.mail.Release(session.Handle)
-		e.phys.Release()
 		env.Release()
-		if regErr != nil || !result.OK {
-			cancelPoll()
+		if regErr != nil {
 			session.closeOAuth()
 			log.Warnf("browser signup fail %s acct=%s: %v", session.Email, session.DiagnosticID, regErr)
+			if ctx.Err() != nil {
+				return
+			}
 			e.fail.Add(1)
-			rateLimited := regErr != nil && (strings.Contains(strings.ToLower(regErr.Error()), "rate limit") ||
-				strings.Contains(strings.ToLower(regErr.Error()), "rate_limited") ||
-				strings.Contains(strings.ToLower(regErr.Error()), "too many") ||
-				strings.Contains(regErr.Error(), "email_code_rate_limited"))
-			if rateLimited {
-				log.Warnf("email/signup rate-limited — backoff before next attempt")
-			}
-			if e.proxies != nil && regErr != nil {
-				e.proxies.ReportFailure(session.Proxy, regErr)
-			}
-			e.noteSignupAttempt(rateLimited)
 			continue
 		}
-		if e.proxies != nil {
-			e.proxies.ReportSuccess(session.Proxy)
-		}
-		e.noteSignupAttempt(false)
+		result := registration.result
+		cancelPoll := registration.cancelPoll
+		pollCh := registration.pollCh
 		session.SSO = strings.TrimSpace(result.SSO)
-		accPath := filepath.Join(e.opt.Run.SSO, "accounts.txt")
-		if err := cpa.AppendSSO(accPath, session.Email, session.Password, session.SSO); err != nil {
-			log.Warnf("write sso: %v", err)
-		}
 		if session.SSO != "" {
+			accPath := filepath.Join(e.opt.Run.SSO, "accounts.txt")
+			if err := cpa.AppendSSO(accPath, session.Email, session.Password, session.SSO); err != nil {
+				log.Warnf("write sso: %v", err)
+			}
 			_ = cpa.AppendAuthSession(filepath.Join(e.opt.Run.SSO, "auth-sessions.jsonl"), session.Email, session.SSO)
+			e.ssoN.Add(1)
+			e.recordRegistrationMetric(session, session.SignupAttempt, "sso", "success", nil)
 		}
-		n := e.ssoN.Add(1)
+		n := e.registrationN.Load()
 		log.OKf("注册成功 #%d %s (browser oauth_session=%v acct=%s)", n, session.Email, result.OAuthAuthorized, session.DiagnosticID)
 		if !result.OAuthAuthorized && session.SSO == "" {
 			cancelPoll()
@@ -1418,6 +1858,7 @@ func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 			err := fmt.Errorf("browser registration succeeded but same-session OAuth was not authorized and SSO export is disabled")
 			log.Warnf("OAuth unavailable %s acct=%s: %v", session.Email, session.DiagnosticID, err)
 			_ = cpa.AppendOAuthFailure(filepath.Join(e.opt.Run.SSO, "oauth-failures.jsonl"), session.Email, err.Error(), session.DiagnosticID)
+			e.recordRegistrationMetric(session, session.SignupAttempt, "oauth", "failure", err)
 			e.fail.Add(1)
 			continue
 		}
@@ -1443,11 +1884,15 @@ func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 			}
 			if pollErr != nil {
 				e.noteOAuthRateResult(pollErr)
-				// The standalone fallback replays the flow from an SSO cookie.
+				e.recordRegistrationMetric(session, session.SignupAttempt, "oauth", "failure", pollErr)
+				// invalid_grant is an account/exit rejection, so never retry the
+				// same mailbox and IP through the standalone flow.
+				invalidGrant := oauth.IsInvalidGrant(pollErr)
+				// Other failures may use the standalone fallback with an SSO cookie.
 				// browser-mcp never exports one (the incognito window is wiped
 				// and closed), so re-queueing only logs a second guaranteed
 				// "missing SSO session" failure per account.
-				retryable := session.SSO != ""
+				retryable := session.SSO != "" && !invalidGrant
 				if retryable {
 					log.Warnf("OAuth poll fail %s acct=%s: %v；回退独立 OAuth", session.Email, session.DiagnosticID, pollErr)
 				} else {
@@ -1462,12 +1907,18 @@ func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 				if e.proxies != nil {
 					e.proxies.ReportFailure(session.Proxy, pollErr)
 				}
+				if invalidGrant {
+					session.closeOAuth()
+					e.fail.Add(1)
+					e.noteOAuthOutcomeForSession(session, pollErr)
+					continue
+				}
 				if !retryable {
 					session.closeOAuth()
 					e.fail.Add(1)
 					// Same-session invalid_grant is the authoritative verdict
 					// here; without it the breaker never sees these rejections.
-					e.noteOAuthOutcomeFor(session.Email, pollErr)
+					e.noteOAuthOutcomeForSession(session, pollErr)
 					continue
 				}
 				if err := e.enqueueOAuth(ctx, session); err != nil {
@@ -1476,7 +1927,7 @@ func (e *Engine) cWorkerBrowser(ctx context.Context, id int) {
 				}
 				continue
 			}
-			e.noteOAuthOutcomeFor(session.Email, nil)
+			e.noteOAuthOutcomeForSession(session, nil)
 			e.noteOAuthRateResult(nil)
 			if err := e.completeAccount(ctx, session, cred, "same-session oauth"); err != nil {
 				log.Warnf("CPA finalize fail %s acct=%s: %v", session.Email, session.DiagnosticID, err)
@@ -1567,7 +2018,7 @@ func deriveWorkers(cfg config.Config) (s, p, c, oa, phys int) {
 
 func isBrowserRegisterMode(mode string) bool {
 	mode = strings.ToLower(strings.TrimSpace(mode))
-	return mode == "" || mode == "browser" || mode == "browser-mcp"
+	return mode == "" || mode == "browser" || mode == "camoufox" || mode == "browser-mcp"
 }
 
 func maxInt(a, b int) int {

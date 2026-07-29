@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/grok-free-register/grok-reg/internal/egress"
 	"github.com/grok-free-register/grok-reg/internal/turnstile"
 )
 
@@ -45,14 +46,17 @@ type BrowserCookie struct {
 	SameSite string `json:"sameSite"`
 }
 
-// BrowserOptions configures one CloakBrowser signup attempt.
+// BrowserOptions configures one CloakBrowser or Camoufox signup attempt.
 type BrowserOptions struct {
-	Proxy         string
-	Timeout       time.Duration
-	CodeTimeout   time.Duration
-	DiagnosticDir string
-	Chrome        string
-	Tracef        func(string, ...any)
+	Proxy                   string
+	Engine                  string // chromium (CloakBrowser) or camoufox
+	Timeout                 time.Duration
+	CodeTimeout             time.Duration
+	DiagnosticDir           string
+	Chrome                  string
+	TurnstileInjectFallback bool
+	TurnstileInjectAfter    time.Duration
+	Tracef                  func(string, ...any)
 }
 
 // Driver is the browser-signup boundary consumed by the pipeline. Both the
@@ -62,6 +66,7 @@ type Driver interface {
 	Name() string
 	SetProxy(string)
 	Proxy() string
+	SetEgress(egress.Profile)
 	SetDiagnosticDir(string)
 	DiagnosticDir() string
 	Register(context.Context, string, string, string, string, func(context.Context) (string, error)) (BrowserResult, error)
@@ -74,6 +79,7 @@ type Browser struct {
 	python string
 	script string
 	opt    BrowserOptions
+	egress egress.Profile
 
 	// One signup browser at a time — CloakBrowser + proxy is heavy and serial
 	// behaviour matches human-ish traffic better than parallel mints.
@@ -81,21 +87,25 @@ type Browser struct {
 }
 
 type browserInput struct {
-	Email           string  `json:"email"`
-	Password        string  `json:"password"`
-	GivenName       string  `json:"given_name,omitempty"`
-	FamilyName      string  `json:"family_name,omitempty"`
-	Proxy           string  `json:"proxy,omitempty"`
-	Chrome          string  `json:"chrome,omitempty"`
-	TimeoutSec      float64 `json:"timeout_sec"`
-	CodeTimeoutSec  float64 `json:"code_timeout_sec"`
-	OAuthTimeoutSec float64 `json:"oauth_timeout_sec,omitempty"`
-	CodeFile        string  `json:"code_file,omitempty"`
-	Code            string  `json:"code,omitempty"`
-	Headless        bool    `json:"headless"`
-	DiagnosticDir   string  `json:"diagnostic_dir,omitempty"`
-	URL             string  `json:"url,omitempty"`
-	VerificationURL string  `json:"verification_url,omitempty"`
+	Email                   string         `json:"email"`
+	Password                string         `json:"password"`
+	GivenName               string         `json:"given_name,omitempty"`
+	FamilyName              string         `json:"family_name,omitempty"`
+	Proxy                   string         `json:"proxy,omitempty"`
+	Chrome                  string         `json:"chrome,omitempty"`
+	TimeoutSec              float64        `json:"timeout_sec"`
+	CodeTimeoutSec          float64        `json:"code_timeout_sec"`
+	OAuthTimeoutSec         float64        `json:"oauth_timeout_sec,omitempty"`
+	CodeFile                string         `json:"code_file,omitempty"`
+	Code                    string         `json:"code,omitempty"`
+	Headless                bool           `json:"headless"`
+	DiagnosticDir           string         `json:"diagnostic_dir,omitempty"`
+	URL                     string         `json:"url,omitempty"`
+	VerificationURL         string         `json:"verification_url,omitempty"`
+	Engine                  string         `json:"engine,omitempty"`
+	Egress                  egress.Profile `json:"egress,omitempty"`
+	TurnstileInjectFallback bool           `json:"turnstile_inject_fallback,omitempty"`
+	TurnstileInjectAfterSec float64        `json:"turnstile_inject_after_sec,omitempty"`
 }
 
 func NewBrowser(opt BrowserOptions) *Browser {
@@ -104,6 +114,12 @@ func NewBrowser(opt BrowserOptions) *Browser {
 	}
 	if opt.CodeTimeout <= 0 {
 		opt.CodeTimeout = 100 * time.Second
+	}
+	if strings.TrimSpace(opt.Engine) == "" {
+		opt.Engine = "chromium"
+	}
+	if opt.TurnstileInjectAfter <= 0 {
+		opt.TurnstileInjectAfter = 35 * time.Second
 	}
 	chrome := strings.TrimSpace(opt.Chrome)
 	if chrome == "" {
@@ -117,7 +133,20 @@ func NewBrowser(opt BrowserOptions) *Browser {
 	}
 }
 
-func (b *Browser) Name() string { return "cloakbrowser-signup" }
+// NewCamoufoxBrowser uses the same audited signup flow with Camoufox as the
+// browser engine. It remains opt-in so existing installs without Camoufox keep
+// working.
+func NewCamoufoxBrowser(opt BrowserOptions) *Browser {
+	opt.Engine = "camoufox"
+	return NewBrowser(opt)
+}
+
+func (b *Browser) Name() string {
+	if strings.EqualFold(b.opt.Engine, "camoufox") {
+		return "camoufox-signup"
+	}
+	return "cloakbrowser-signup"
+}
 
 // SetProxy updates the proxy used by the next Register call.
 // Safe for serial browser workers (phys=1 / c=1).
@@ -127,6 +156,10 @@ func (b *Browser) SetProxy(proxy string) {
 
 // Proxy returns the currently configured proxy URL.
 func (b *Browser) Proxy() string { return b.opt.Proxy }
+
+// SetEgress supplies the public identity resolved through Proxy. The Python
+// driver uses it to align locale, timezone, geolocation, and WebRTC policy.
+func (b *Browser) SetEgress(profile egress.Profile) { b.egress = profile }
 
 // SetDiagnosticDir scopes browser artifacts to the next account attempt.
 // Safe for serial browser workers (phys=1 / c=1).
@@ -213,20 +246,24 @@ func (b *Browser) RegisterWithOAuth(ctx context.Context, email, password, given,
 	headless, commandName, commandArgs := resolveBrowserDisplay(commandName, commandArgs, signupDisplayMode())
 
 	payload, err := json.Marshal(browserInput{
-		Email:           email,
-		Password:        password,
-		GivenName:       given,
-		FamilyName:      family,
-		Proxy:           b.opt.Proxy,
-		Chrome:          b.opt.Chrome,
-		TimeoutSec:      b.opt.Timeout.Seconds(),
-		CodeTimeoutSec:  b.opt.CodeTimeout.Seconds(),
-		OAuthTimeoutSec: 100,
-		CodeFile:        codeFile,
-		Headless:        headless,
-		DiagnosticDir:   b.opt.DiagnosticDir,
-		URL:             "https://accounts.x.ai/sign-up?redirect=grok-com",
-		VerificationURL: strings.TrimSpace(verificationURL),
+		Email:                   email,
+		Password:                password,
+		GivenName:               given,
+		FamilyName:              family,
+		Proxy:                   b.opt.Proxy,
+		Chrome:                  b.opt.Chrome,
+		TimeoutSec:              b.opt.Timeout.Seconds(),
+		CodeTimeoutSec:          b.opt.CodeTimeout.Seconds(),
+		OAuthTimeoutSec:         100,
+		CodeFile:                codeFile,
+		Headless:                headless,
+		DiagnosticDir:           b.opt.DiagnosticDir,
+		URL:                     "https://accounts.x.ai/sign-up?redirect=grok-com",
+		VerificationURL:         strings.TrimSpace(verificationURL),
+		Engine:                  strings.ToLower(strings.TrimSpace(b.opt.Engine)),
+		Egress:                  b.egress,
+		TurnstileInjectFallback: b.opt.TurnstileInjectFallback,
+		TurnstileInjectAfterSec: b.opt.TurnstileInjectAfter.Seconds(),
 	})
 	if err != nil {
 		return BrowserResult{}, fmt.Errorf("signup_browser_config: %w", err)

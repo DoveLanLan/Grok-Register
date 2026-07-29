@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/grok-free-register/grok-reg/internal/egress"
 )
 
 // Pool is a small round-robin proxy list with health + cooldown.
@@ -23,6 +25,7 @@ type Pool struct {
 	probeTo time.Duration
 	cool    time.Duration
 	logf    func(string, ...any)
+	inspect *egress.Inspector
 }
 
 type item struct {
@@ -34,6 +37,7 @@ type item struct {
 	lastErr   string
 	healthy   bool
 	checked   bool
+	profile   egress.Profile
 }
 
 // Options configures a Pool.
@@ -46,6 +50,9 @@ type Options struct {
 	Cooldown time.Duration
 	// Logf optional debug/info logger.
 	Logf func(string, ...any)
+	// Inspector performs strict Cloudflare-visible exit IP and policy checks.
+	// When nil, the pool keeps the legacy reachability-only behavior.
+	Inspector *egress.Inspector
 }
 
 // New builds a pool. Returns nil if no proxies were provided.
@@ -74,7 +81,7 @@ func New(opt Options) *Pool {
 	if cool <= 0 {
 		cool = 10 * time.Minute
 	}
-	return &Pool{items: items, probeTo: to, cool: cool, logf: opt.Logf}
+	return &Pool{items: items, probeTo: to, cool: cool, logf: opt.Logf, inspect: opt.Inspector}
 }
 
 // Len returns configured proxy count.
@@ -121,7 +128,14 @@ func (p *Pool) Snapshot() string {
 		if now.Before(it.coolUntil) {
 			state = fmt.Sprintf("cool%ds", int(it.coolUntil.Sub(now).Seconds()))
 		}
-		parts = append(parts, fmt.Sprintf("%s(%s,ok=%d,fail=%d)", it.label, state, it.successes, it.fails))
+		identity := ""
+		if it.profile.IP != "" {
+			identity = "@" + it.profile.IP
+			if it.profile.ASN > 0 {
+				identity += fmt.Sprintf("/AS%d", it.profile.ASN)
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%s%s(%s,ok=%d,fail=%d)", it.label, identity, state, it.successes, it.fails))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -134,24 +148,28 @@ func (p *Pool) Primary() string {
 	return p.items[0].raw
 }
 
-// ProbeAll checks each proxy against accounts.x.ai (any HTTP response counts as
-// reachable — CF 403 is fine; dial/reset/timeout is not).
+// ProbeAll checks each proxy's Cloudflare-visible exit identity and then
+// verifies accounts.x.ai reachability. A configured Inspector makes a valid
+// public exit IP mandatory before the proxy can become healthy.
 func (p *Pool) ProbeAll(ctx context.Context) (live int) {
 	if p == nil {
 		return 0
 	}
 	for i := range p.items {
-		ok, err := p.probeOne(ctx, p.items[i].raw)
+		profile, err := p.probeOne(ctx, p.items[i].raw)
+		ok := err == nil
 		p.mu.Lock()
 		p.items[i].checked = true
 		p.items[i].healthy = ok
 		if ok {
 			live++
 			p.items[i].lastErr = ""
+			p.items[i].profile = profile
 			if p.logf != nil {
-				p.logf("proxy probe ok %s", p.items[i].label)
+				p.logf("proxy probe ok %s %s", p.items[i].label, profile.Summary())
 			}
 		} else {
+			p.items[i].fails++
 			p.items[i].lastErr = errString(err)
 			p.items[i].coolUntil = time.Now().Add(p.cool)
 			if p.logf != nil {
@@ -161,6 +179,73 @@ func (p *Pool) ProbeAll(ctx context.Context) (live int) {
 		p.mu.Unlock()
 	}
 	return live
+}
+
+// Prepare returns the next usable proxy after refreshing its exit identity.
+// Unlike Next, it never hands a known-bad or policy-blocked exit to a browser.
+func (p *Pool) Prepare(ctx context.Context) (string, egress.Profile, error) {
+	if p == nil || len(p.items) == 0 {
+		return "", egress.Profile{}, nil
+	}
+	p.mu.Lock()
+	n := len(p.items)
+	start := p.next
+	p.mu.Unlock()
+	var lastErr error
+	for offset := 0; offset < n; offset++ {
+		idx := (start + offset) % n
+		p.mu.Lock()
+		it := &p.items[idx]
+		if time.Now().Before(it.coolUntil) {
+			p.mu.Unlock()
+			continue
+		}
+		raw, label := it.raw, it.label
+		p.mu.Unlock()
+
+		profile, err := p.probeOne(ctx, raw)
+		p.mu.Lock()
+		it = &p.items[idx]
+		it.checked = true
+		if err == nil {
+			it.healthy = true
+			it.lastErr = ""
+			it.profile = profile
+			it.coolUntil = time.Time{}
+			p.next = (idx + 1) % n
+			p.mu.Unlock()
+			if p.logf != nil {
+				p.logf("proxy prepared %s %s", label, profile.Summary())
+			}
+			return raw, profile, nil
+		}
+		it.healthy = false
+		it.fails++
+		it.lastErr = errString(err)
+		it.coolUntil = time.Now().Add(p.cool)
+		p.mu.Unlock()
+		lastErr = err
+		if p.logf != nil {
+			p.logf("proxy rejected %s: %v", label, err)
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("all proxy exits are cooling")
+	}
+	return "", egress.Profile{}, lastErr
+}
+
+// Profile returns the last successfully resolved identity for raw.
+func (p *Pool) Profile(raw string) (egress.Profile, bool) {
+	if p == nil {
+		return egress.Profile{}, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if it := p.find(raw); it != nil && it.profile.IP != "" {
+		return it.profile, true
+	}
+	return egress.Profile{}, false
 }
 
 // Next returns the next usable proxy. If all are cooling, returns the soonest
@@ -253,15 +338,23 @@ func (p *Pool) find(raw string) *item {
 	return nil
 }
 
-func (p *Pool) probeOne(ctx context.Context, raw string) (bool, error) {
+func (p *Pool) probeOne(ctx context.Context, raw string) (egress.Profile, error) {
+	var profile egress.Profile
+	if p.inspect != nil {
+		var err error
+		profile, err = p.inspect.Inspect(ctx, raw)
+		if err != nil {
+			return profile, err
+		}
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return false, err
+		return profile, err
 	}
 	if u.Scheme == "" {
 		u, err = url.Parse("http://" + raw)
 		if err != nil {
-			return false, err
+			return profile, err
 		}
 	}
 	transport := &http.Transport{
@@ -273,7 +366,7 @@ func (p *Pool) probeOne(ctx context.Context, raw string) (bool, error) {
 		TLSHandshakeTimeout:   p.probeTo,
 		ResponseHeaderTimeout: p.probeTo,
 		// Don't verify carefully — we only care that the tunnel works.
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 		DisableKeepAlives: true,
 	}
 	client := &http.Client{
@@ -285,16 +378,18 @@ func (p *Pool) probeOne(ctx context.Context, raw string) (bool, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://accounts.x.ai/sign-up", nil)
 	if err != nil {
-		return false, err
+		return profile, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; grok-reg-proxy-probe/1.0)")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, err
+		return profile, err
 	}
 	_ = resp.Body.Close()
-	// Any HTTP status means CONNECT + TLS worked.
-	return true, nil
+	if resp.StatusCode == http.StatusProxyAuthRequired || resp.StatusCode >= 500 {
+		return profile, fmt.Errorf("accounts probe http=%d", resp.StatusCode)
+	}
+	return profile, nil
 }
 
 func isTransportErr(err error) bool {

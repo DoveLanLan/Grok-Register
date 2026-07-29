@@ -39,6 +39,7 @@ install:
 	@echo "installed: /usr/local/share/grok-reg/signup_browser.py"
 	@echo "try: grok help"
 	@echo "Turnstile: pip install -r scripts/requirements-turnstile.txt && python -m cloakbrowser install"
+	@echo "Camoufox (optional): camoufox fetch"
 
 uninstall:
 	rm -f $(BINDIR)/$(APP)

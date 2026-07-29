@@ -166,6 +166,43 @@ func TestOutlookPoolAllocatesAliasesPersistentlyAndSerializesMailbox(t *testing.
 	}
 }
 
+func TestDomainProviderSwitchesFutureAllocationsToOutlook(t *testing.T) {
+	root := t.TempDir()
+	accountsPath := filepath.Join(root, "accounts.txt")
+	writeOutlookFixture(t, accountsPath, "fallback@outlook.com----mail-pass----client-id----refresh-token")
+	provider := New(Config{
+		Mode:                     config.EmailCustom,
+		Domain:                   "domain.example",
+		InvalidGrantFallback:     "outlook",
+		OutlookAccountsFile:      accountsPath,
+		OutlookStateFile:         filepath.Join(root, "outlook-state.json"),
+		OutlookAliasesPerAccount: 2,
+	})
+	if err := provider.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	primary, err := provider.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if primary.Kind != "custom" || !strings.HasSuffix(primary.Email, "@domain.example") {
+		t.Fatalf("primary = %+v", primary)
+	}
+	if !provider.SwitchToOutlook() || !provider.UsingOutlook() {
+		t.Fatal("provider did not switch to Outlook")
+	}
+	fallback, err := provider.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.Kind != "outlook" || fallback.MainEmail != "fallback@outlook.com" {
+		t.Fatalf("fallback = %+v", fallback)
+	}
+	if provider.SwitchToOutlook() {
+		t.Fatal("second switch should be a no-op")
+	}
+}
+
 func TestOutlookProviderValidatesMissingAccountPool(t *testing.T) {
 	provider := New(Config{Mode: config.EmailOutlook})
 	if err := provider.Validate(); err == nil || !strings.Contains(err.Error(), "OUTLOOK_ACCOUNTS_FILE") {

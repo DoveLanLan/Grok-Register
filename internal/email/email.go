@@ -50,10 +50,12 @@ type Provider struct {
 	lolNextOK time.Time
 	// cfTempDomains is the rotation pool built from CFTempDomain; benched
 	// entries are skipped until the pool would otherwise be empty.
-	cfTempDomains []string
-	cfTempBenched map[string]struct{}
-	outlook       *outlookPool
-	outlookErr    error
+	cfTempDomains   []string
+	cfTempBenched   map[string]struct{}
+	outlook         *outlookPool
+	outlookErr      error
+	outlookFallback bool
+	useOutlook      bool
 }
 
 type Config struct {
@@ -71,6 +73,7 @@ type Config struct {
 	OutlookStateFile         string
 	OutlookAliasesPerAccount int
 	OutlookPollInterval      time.Duration
+	InvalidGrantFallback     string
 	HTTPClient               *http.Client
 }
 
@@ -93,11 +96,13 @@ func New(cfg Config) *Provider {
 		cfg.LOLIntervalMS = 400
 	}
 	p := &Provider{
-		cfg:           cfg,
-		cfTempDomains: SplitDomains(cfg.CFTempDomain),
-		cfTempBenched: map[string]struct{}{},
+		cfg:             cfg,
+		cfTempDomains:   SplitDomains(cfg.CFTempDomain),
+		cfTempBenched:   map[string]struct{}{},
+		outlookFallback: strings.EqualFold(strings.TrimSpace(cfg.InvalidGrantFallback), "outlook"),
+		useOutlook:      cfg.Mode == config.EmailOutlook,
 	}
-	if cfg.Mode == config.EmailOutlook {
+	if cfg.Mode == config.EmailOutlook || p.outlookFallback {
 		p.outlook, p.outlookErr = newOutlookPool(cfg)
 	}
 	return p
@@ -107,7 +112,7 @@ func New(cfg Config) *Provider {
 // mailbox API errors remain Create-time errors, while an Outlook pool must be
 // readable before a batch starts.
 func (p *Provider) Validate() error {
-	if p.cfg.Mode == config.EmailOutlook {
+	if p.cfg.Mode == config.EmailOutlook || p.outlookFallback {
 		return p.outlookErr
 	}
 	return nil
@@ -116,7 +121,7 @@ func (p *Provider) Validate() error {
 // OutlookRemaining returns the number of not-yet-reserved aliases in the
 // persistent pool. The boolean is false for non-Outlook modes.
 func (p *Provider) OutlookRemaining() (int, bool) {
-	if p.cfg.Mode != config.EmailOutlook || p.outlook == nil {
+	if p.outlook == nil {
 		return 0, false
 	}
 	return p.outlook.remaining(), true
@@ -128,10 +133,46 @@ func (p *Provider) OutlookPreviews() ([]OutlookAliasPreview, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
-	if p.cfg.Mode != config.EmailOutlook || p.outlook == nil {
+	if p.outlook == nil {
 		return nil, fmt.Errorf("当前不是 Outlook 邮箱模式")
 	}
 	return p.outlook.previews(), nil
+}
+
+// OutlookFallbackEnabled reports whether domain-mailbox invalid_grant can
+// switch future allocations to the imported Outlook alias pool.
+func (p *Provider) OutlookFallbackEnabled() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.outlookFallback && p.outlook != nil && p.outlookErr == nil
+}
+
+// UsingOutlook reports the currently active allocation source.
+func (p *Provider) UsingOutlook() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.useOutlook
+}
+
+// SwitchToOutlook atomically changes future Create calls to Outlook. Already
+// staged domain handles are rejected by the pipeline before they are used.
+func (p *Provider) SwitchToOutlook() bool {
+	if p == nil || !p.OutlookFallbackEnabled() || p.outlook.remaining() <= 0 {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.useOutlook {
+		return false
+	}
+	p.useOutlook = true
+	return true
 }
 
 // SplitDomains parses a comma/whitespace separated mailbox domain list.
@@ -217,6 +258,18 @@ func randStr(n int) string {
 
 func (p *Provider) Create() (Handle, error) {
 	password := randStr(15)
+	p.mu.Lock()
+	useOutlook := p.useOutlook
+	p.mu.Unlock()
+	if useOutlook {
+		if p.outlookErr != nil {
+			return Handle{}, p.outlookErr
+		}
+		if p.outlook == nil {
+			return Handle{}, fmt.Errorf("Outlook 邮箱池未初始化")
+		}
+		return p.outlook.reserve(password)
+	}
 	switch p.cfg.Mode {
 	case config.EmailCustom:
 		email := fmt.Sprintf("oc%s@%s", randStr(10), p.cfg.Domain)
@@ -228,14 +281,6 @@ func (p *Provider) Create() (Handle, error) {
 		}
 		h.Password = password
 		return h, nil
-	case config.EmailOutlook:
-		if p.outlookErr != nil {
-			return Handle{}, p.outlookErr
-		}
-		if p.outlook == nil {
-			return Handle{}, fmt.Errorf("Outlook 邮箱池未初始化")
-		}
-		return p.outlook.reserve(password)
 	}
 	var last error
 	for i := 0; i < p.cfg.LOLRetries; i++ {

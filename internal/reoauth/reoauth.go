@@ -54,6 +54,13 @@ type Options struct {
 	Secret      []byte
 	// Uploader: when non-nil and Enabled(), successful CPA files are pushed to Management API.
 	Uploader *cpa.Uploader
+	// ConfirmMode selects device-flow approval: "http" (SSO cookie) or "browser"
+	// (CloakBrowser UI, can re-login with email/password when SSO is dead).
+	ConfirmMode string
+	// BrowserTimeout bounds one browser approval attempt.
+	BrowserTimeout time.Duration
+	// BrowserDiagnosticDir stores per-attempt screenshots/HTML when set.
+	BrowserDiagnosticDir string
 }
 
 func logf(opt Options, f string, a ...any) {
@@ -478,9 +485,29 @@ func Run(ctx context.Context, accs []Account, opt Options) ([]Result, error) {
 	var nextAt time.Time
 	var okN, failN, skipN, upOK, upFail atomic.Int64
 
-	worker := func() {
+	confirmMode := strings.ToLower(strings.TrimSpace(opt.ConfirmMode))
+	if confirmMode == "" {
+		confirmMode = "http"
+	}
+	browserTimeout := opt.BrowserTimeout
+	if browserTimeout <= 0 {
+		browserTimeout = 150 * time.Second
+	}
+
+	worker := func(workerID int) {
 		defer wg.Done()
-		cli, err := oauth.NewClient(opt.Proxy, nil, 60*time.Second)
+		diagDir := ""
+		if opt.BrowserDiagnosticDir != "" {
+			diagDir = filepath.Join(opt.BrowserDiagnosticDir, fmt.Sprintf("w%d", workerID))
+		}
+		cli, err := oauth.NewClient(opt.Proxy, nil, 60*time.Second, oauth.Options{
+			ConfirmMode:          confirmMode,
+			BrowserTimeout:       browserTimeout,
+			BrowserDiagnosticDir: diagDir,
+			Tracef: func(format string, args ...any) {
+				logf(opt, "[oauth] "+format, args...)
+			},
+		})
 		if err != nil {
 			logf(opt, "oauth client: %v", err)
 			return
@@ -542,9 +569,15 @@ func Run(ctx context.Context, accs []Account, opt Options) ([]Result, error) {
 	if n < 1 {
 		n = 1
 	}
+	// Browser approvals are heavy (real Chromium). Cap parallelism harder than HTTP.
+	if confirmMode == "browser" && n > 3 {
+		n = 3
+		logf(opt, "browser 模式并发上限 3（请求 %d）", opt.Workers)
+	}
+	logf(opt, "reoauth workers=%d confirm=%s accounts=%d", n, confirmMode, len(accs))
 	wg.Add(n)
 	for i := 0; i < n; i++ {
-		go worker()
+		go worker(i)
 	}
 	for i, a := range accs {
 		jobs <- job{a: a, i: i}
@@ -569,26 +602,43 @@ func reauthOne(ctx context.Context, cli *oauth.Client, a Account, opt Options) R
 	var err error
 	method := ""
 
-	if strings.TrimSpace(a.RefreshToken) != "" {
+	tryDevice := func(reason string) {
+		sso := strings.TrimSpace(a.SSO)
+		password := strings.TrimSpace(a.Password)
+		if sso == "" && (email == "" || password == "") {
+			if err == nil {
+				err = fmt.Errorf("无 sso 且无 email/password，无法 device 重登")
+			}
+			return
+		}
+		if reason != "" {
+			logf(opt, "  %s %s，回退 device(confirm=%s, sso=%v, password=%v)…",
+				email, reason, cli.ConfirmMode(), sso != "", password != "")
+		}
+		method = "device"
+		// Prefer ExchangeAccount so browser mode can re-login when SSO is dead.
+		if email != "" && password != "" {
+			cred, err = cli.ExchangeAccount(ctx, sso, email, password)
+			return
+		}
+		cred, err = cli.Exchange(ctx, sso)
+	}
+
+	switch {
+	case strings.TrimSpace(a.RefreshToken) != "":
 		method = "refresh"
 		cred, err = cli.Refresh(ctx, a.RefreshToken)
-	} else if strings.TrimSpace(a.SSO) != "" {
-		method = "device"
-		cred, err = cli.Exchange(ctx, a.SSO)
-	} else {
+		if err != nil {
+			tryDevice("refresh 失败: " + err.Error())
+		}
+	case strings.TrimSpace(a.SSO) != "" || (email != "" && strings.TrimSpace(a.Password) != ""):
+		tryDevice("")
+	default:
 		res.Method = "skip"
-		res.Err = "无 refresh_token 且无 sso（inspection 仅含 email 时请提供本地 outputs 或 CPA/accounts）"
+		res.Err = "无 refresh_token / sso / email+password（inspection 仅含 email 时请提供本地 outputs 或 CPA/accounts）"
 		return res
 	}
 	res.Method = method
-	if err != nil {
-		// if refresh failed, try device when sso present
-		if method == "refresh" && strings.TrimSpace(a.SSO) != "" {
-			logf(opt, "  %s refresh 失败，回退 device…", email)
-			cred, err = cli.Exchange(ctx, a.SSO)
-			res.Method = "device"
-		}
-	}
 	if err != nil {
 		res.Err = err.Error()
 		return res
