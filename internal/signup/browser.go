@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/grok-free-register/grok-reg/internal/egress"
+	"github.com/grok-free-register/grok-reg/internal/proxybridge"
 	"github.com/grok-free-register/grok-reg/internal/turnstile"
 )
 
@@ -209,6 +211,17 @@ func (b *Browser) RegisterWithOAuth(ctx context.Context, email, password, given,
 		_ = os.Chmod(b.opt.DiagnosticDir, 0o700)
 	}
 
+	browserProxy, bridge, bridgeErr := bridgeBrowserProxy(b.opt.Proxy)
+	if bridgeErr != nil {
+		return BrowserResult{}, fmt.Errorf("signup_browser_proxy_bridge: %w", bridgeErr)
+	}
+	if bridge != nil {
+		defer bridge.Close()
+		if b.opt.Tracef != nil {
+			b.opt.Tracef("Browser proxy bridge active local=%s upstream=socks5", browserProxy)
+		}
+	}
+
 	// Poll mailbox only after the browser signals that the code field is visible
 	// (code_file.ready). Starting earlier wastes the mailbox poll budget before
 	// x.ai has even sent the message.
@@ -250,7 +263,7 @@ func (b *Browser) RegisterWithOAuth(ctx context.Context, email, password, given,
 		Password:                password,
 		GivenName:               given,
 		FamilyName:              family,
-		Proxy:                   b.opt.Proxy,
+		Proxy:                   browserProxy,
 		Chrome:                  b.opt.Chrome,
 		TimeoutSec:              b.opt.Timeout.Seconds(),
 		CodeTimeoutSec:          b.opt.CodeTimeout.Seconds(),
@@ -355,6 +368,26 @@ func (b *Browser) RegisterWithOAuth(ctx context.Context, email, password, given,
 		parts = append(parts, "error=missing_sso")
 	}
 	return result, fmt.Errorf("%s", strings.Join(parts, " "))
+}
+
+func bridgeBrowserProxy(raw string) (string, *proxybridge.Bridge, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil, nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse browser proxy: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "socks5" && scheme != "socks5h" {
+		return raw, nil, nil
+	}
+	bridge, err := proxybridge.Start(raw)
+	if err != nil {
+		return "", nil, err
+	}
+	return bridge.URL(), bridge, nil
 }
 
 // displayMode selects how Chromium is shown.

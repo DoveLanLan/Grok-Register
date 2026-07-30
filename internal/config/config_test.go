@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestCFTempAliasesAndFields(t *testing.T) {
 	t.Parallel()
@@ -63,6 +66,26 @@ func TestCamoufoxEgressAndTurnstileConfig(t *testing.T) {
 	}
 }
 
+func TestBrowserRuntimePaths(t *testing.T) {
+	t.Setenv("GROK_PYTHON", "")
+	t.Setenv("CHROME_PATH", "")
+	cfg := Defaults()
+	applyMap(&cfg, map[string]string{
+		"GROK_PYTHON": "/secure/playwright/bin/python",
+		"CHROME_PATH": "/Applications/Chromium Test.app/Contents/MacOS/Chromium",
+	})
+	ApplyProxyEnv(cfg)
+	if cfg.GrokPython != "/secure/playwright/bin/python" || cfg.ChromePath == "" {
+		t.Fatalf("unexpected browser runtime config: %+v", cfg)
+	}
+	if got := os.Getenv("GROK_PYTHON"); got != cfg.GrokPython {
+		t.Fatalf("GROK_PYTHON=%q", got)
+	}
+	if got := os.Getenv("CHROME_PATH"); got != cfg.ChromePath {
+		t.Fatalf("CHROME_PATH=%q", got)
+	}
+}
+
 func TestOutlookConfigAliasesAndLimits(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"outlook", "hotmail", "microsoft", "ms"} {
@@ -90,6 +113,7 @@ func TestInvalidGrantFallbackAndWebshareConfig(t *testing.T) {
 		"INVALID_GRANT_STATE_FILE":      "/secure/invalid-grants.json",
 		"REGISTER_PROXY_PROVIDER":       "WebShare",
 		"WEBSHARE_PROXY_TEMPLATE":       "http://user-{session}:pass@p.webshare.io:80",
+		"WEBSHARE_GATEWAYS":             "192.0.2.10,192.0.2.11",
 		"WEBSHARE_MAX_SESSION_ATTEMPTS": "12",
 	})
 	if cfg.EmailInvalidGrantFallback != "outlook" {
@@ -103,6 +127,20 @@ func TestInvalidGrantFallbackAndWebshareConfig(t *testing.T) {
 	}
 	if cfg.WebshareProxyTemplate != "http://user-{session}:pass@p.webshare.io:80" {
 		t.Fatalf("WebshareProxyTemplate = %q", cfg.WebshareProxyTemplate)
+	}
+	if cfg.WebshareGateways != "192.0.2.10,192.0.2.11" {
+		t.Fatalf("WebshareGateways = %q", cfg.WebshareGateways)
+	}
+}
+
+func TestEmailProviderRotationConfig(t *testing.T) {
+	cfg := Defaults()
+	applyMap(&cfg, map[string]string{
+		"EMAIL_MODE":              "cf_temp_email",
+		"EMAIL_PROVIDER_ROTATION": "CF_TEMP_EMAIL,Outlook",
+	})
+	if cfg.EmailMode != EmailCFTemp || cfg.EmailProviderRotation != "cf_temp_email,outlook" {
+		t.Fatalf("unexpected email rotation config: %+v", cfg)
 	}
 }
 

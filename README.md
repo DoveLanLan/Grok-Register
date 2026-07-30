@@ -319,6 +319,20 @@ RefreshToken 都持久化到 `outlook-state.json`，所以 `check` 预览、随�
 同时只允许一个别名等待验证码，以免多封邮件串码。导入格式里的邮箱密码不会用于
 登录或作为 Grok 密码。
 
+严格按 Cloudflare → Outlook → Cloudflare 轮询：
+
+```env
+EMAIL_MODE=cf_temp_email
+CF_TEMP_EMAIL_API=https://mail-api.example.com
+CF_TEMP_EMAIL_DOMAIN=mail1.example.com,mail2.example.com
+EMAIL_PROVIDER_ROTATION=cf_temp_email,outlook
+EMAIL_INVALID_GRANT_FALLBACK=
+```
+
+轮询游标只在邮箱成功分配后推进；Cloudflare 建号临时失败时仍重试 Cloudflare，
+不会跳过到 Outlook。每次进程启动都从序列第一个来源开始。显式轮询与“域名邮箱
+失败后永久切 Outlook”的 `EMAIL_INVALID_GRANT_FALLBACK=outlook` 模式互斥。
+
 域名邮箱自动切 Outlook，并使用 Webshare Rotating Residential：
 
 ```env
@@ -330,8 +344,11 @@ EMAIL_INVALID_GRANT_FALLBACK=outlook
 
 REGISTER_MODE=browser
 REGISTER_PROXY_PROVIDER=webshare
-# 以 Webshare Dashboard 显示的认证格式为准，只把 session 部分换成 {session}
-WEBSHARE_PROXY_TEMPLATE=http://USERNAME-{session}:PASSWORD@p.webshare.io:80
+# Endpoint Generator 选 Sticky + SOCKS5，只把用户名中的 session 部分换成 {session}
+# p.webshare.io 不可达时，将它换成下载列表里的一个 Gateway IP
+WEBSHARE_PROXY_TEMPLATE=socks5h://USERNAME-{session}:PASSWORD@GATEWAY_IP:80
+# 可选：下载文件中的去重 Gateway IP，用于避让超时入口
+WEBSHARE_GATEWAYS=GATEWAY_IP_1,GATEWAY_IP_2,GATEWAY_IP_3
 WEBSHARE_MAX_SESSION_ATTEMPTS=8
 EGRESS_STRICT=1
 ```
@@ -339,6 +356,11 @@ EGRESS_STRICT=1
 `{session}` 是必需占位符。程序为每个账号生成新的 12 位 session，连续两次通过
 Cloudflare trace 检查实际出口；只有两次 IP 相同且能访问 `accounts.x.ai` 才会创建
 邮箱。注册浏览器、同会话 OAuth 和独立 OAuth 都沿用该账号的同一个代理 URL。
+认证 SOCKS5 会在每次浏览器运行时自动转成仅监听 `127.0.0.1` 的临时 HTTP
+bridge，以绕过 Chromium 不支持 SOCKS5 用户名/密码认证的限制；本地 bridge URL
+不含 Webshare 凭据，浏览器关闭后会一并销毁。
+`WEBSHARE_GATEWAYS` 会按 session 轮询入口；某个 Gateway TCP 超时时，出口预检会自动
+换下一个，避免固定在已失联的入口 IP。
 不要配置“每个请求随机 IP、无法绑定 session”的 endpoint，否则粘性检查会拒绝它。
 Webshare 模式仅支持 `REGISTER_MODE=browser` 或 `camoufox`。
 
@@ -487,7 +509,7 @@ grok test-email --email user@outlook.com
 - **自动上传失败**不影响账号记为成功  
 - **邮箱预创建**按 target 限流，避免 target=5 时狂开邮箱  
 - **OAuth 默认串行**：每个账号使用独立 Cookie Jar；可重试错误会创建全新的 Device Flow
-- **invalid_grant 切换**：域名邮箱立即标记“邮箱 + 实际出口 IP”并切到 Outlook；Webshare 下个账号强制使用新的粘性 session，已标记出口永久跳过
+- **invalid_grant 处理**：始终标记“邮箱 + 实际出口 IP”，Webshare 下个账号强制使用新的粘性 session；fallback 模式会永久切 Outlook，显式邮箱轮询模式则继续按配置序列分配
 - **OAuth 熔断**：域名到 Outlook 的切换会清零一次连续失败预算；Outlook 连续达到 `OAUTH_INVALID_GRANT_LIMIT` 后停止本轮，失败清单写入 `SSO/oauth-failures.jsonl`
 - **OAuth Web 批准**：默认 `OAUTH_CONFIRM_MODE=browser`，使用同一代理和账号 SSO；如 SSO 被拒，会用注册邮箱/密码在浏览器登录。失败截图写入 `outputs/<run>/oauth-browser/`
 - **browser-mcp 会话隔离**：不导出 SSO/Cookie 值；依赖同标签页 OAuth，并在注册前及关窗前清除该无痕 store 的 x.ai/Grok Cookie。CPA 上传同步完成后才会开始下一账号

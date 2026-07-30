@@ -23,6 +23,8 @@ config.env
 *.key
 outlook-accounts*.txt
 outlook-state*.json
+Webshare residential proxies*.txt
+webshare-residential-*.txt
 
 # Go
 vendor/

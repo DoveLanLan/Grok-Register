@@ -104,7 +104,7 @@ func RunSingleEmail(ctx context.Context, opt SingleEmailOptions) (SingleEmailRes
 			risk:            risk,
 		}
 		if proxyProvider == "webshare" {
-			selector.webshare, err = proxypool.NewWebshareSessions(opt.Cfg.WebshareProxyTemplate)
+			selector.webshare, err = proxypool.NewWebshareSessionsWithGateways(opt.Cfg.WebshareProxyTemplate, opt.Cfg.WebshareGateways)
 			if err != nil {
 				return SingleEmailResult{}, err
 			}

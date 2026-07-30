@@ -34,6 +34,9 @@ type Config struct {
 	OutlookStateFile         string
 	OutlookAliasesPerAccount int
 	OutlookPollIntervalSec   float64
+	// EmailProviderRotation is an explicit ordered mailbox source sequence.
+	// Example: "cf_temp_email,outlook" alternates Cloudflare and Outlook.
+	EmailProviderRotation string
 	// EmailInvalidGrantFallback switches future allocations to Outlook after a
 	// domain mailbox receives OAuth invalid_grant. Empty disables failover.
 	EmailInvalidGrantFallback string
@@ -46,8 +49,11 @@ type Config struct {
 	RegisterProxies string
 	// RegisterProxyProvider is "static" or "webshare". Webshare uses a proxy
 	// URL template containing {session} to keep one residential exit per account.
-	RegisterProxyProvider      string
-	WebshareProxyTemplate      string
+	RegisterProxyProvider string
+	WebshareProxyTemplate string
+	// WebshareGateways is a comma/newline list of interchangeable gateway
+	// hosts. Each new sticky session rotates to the next gateway before probe.
+	WebshareGateways           string
 	WebshareMaxSessionAttempts int
 	// EgressStrict requires a Cloudflare-visible public exit IP before a browser
 	// attempt. Optional ASN/ISP policies reject known-bad exits before signup.
@@ -72,6 +78,10 @@ type Config struct {
 
 	// RegisterMode: browser (CloakBrowser), camoufox, browser-mcp, or http (legacy).
 	RegisterMode string
+	// GrokPython and ChromePath can live in config.env so detached workers use
+	// the same Playwright runtime as foreground runs.
+	GrokPython string
+	ChromePath string
 	// BrowserMCPCommand is the browser-mcp JSONL CLI executable. Incognito keeps
 	// cleanup scoped away from the normal profile; the driver also clears the
 	// account domains in that Incognito cookie store before and after each run.
@@ -208,6 +218,7 @@ func Save(path string, cfg Config) error {
 	}
 	b.WriteString(fmt.Sprintf("OUTLOOK_ALIASES_PER_ACCOUNT=%d\n", cfg.OutlookAliasesPerAccount))
 	b.WriteString(fmt.Sprintf("OUTLOOK_POLL_INTERVAL_SEC=%g\n", cfg.OutlookPollIntervalSec))
+	b.WriteString(fmt.Sprintf("EMAIL_PROVIDER_ROTATION=%s\n", cfg.EmailProviderRotation))
 	b.WriteString(fmt.Sprintf("EMAIL_INVALID_GRANT_FALLBACK=%s\n", cfg.EmailInvalidGrantFallback))
 	if cfg.InvalidGrantStateFile != "" {
 		b.WriteString(fmt.Sprintf("INVALID_GRANT_STATE_FILE=%s\n", cfg.InvalidGrantStateFile))
@@ -218,6 +229,9 @@ func Save(path string, cfg Config) error {
 	b.WriteString(fmt.Sprintf("REGISTER_PROXY_PROVIDER=%s\n", cfg.RegisterProxyProvider))
 	if cfg.WebshareProxyTemplate != "" {
 		b.WriteString(fmt.Sprintf("WEBSHARE_PROXY_TEMPLATE=%s\n", cfg.WebshareProxyTemplate))
+	}
+	if cfg.WebshareGateways != "" {
+		b.WriteString(fmt.Sprintf("WEBSHARE_GATEWAYS=%s\n", cfg.WebshareGateways))
 	}
 	b.WriteString(fmt.Sprintf("WEBSHARE_MAX_SESSION_ATTEMPTS=%d\n", cfg.WebshareMaxSessionAttempts))
 	b.WriteString(fmt.Sprintf("EGRESS_STRICT=%s\n", bool01(cfg.EgressStrict)))
@@ -235,6 +249,12 @@ func Save(path string, cfg Config) error {
 	b.WriteString(fmt.Sprintf("TURNSTILE_INJECT_FALLBACK=%s\n", bool01(cfg.TurnstileInjectFallback)))
 	b.WriteString(fmt.Sprintf("TURNSTILE_INJECT_AFTER_SEC=%g\n", cfg.TurnstileInjectAfterSec))
 	b.WriteString(fmt.Sprintf("REGISTER_MODE=%s\n", cfg.RegisterMode))
+	if cfg.GrokPython != "" {
+		b.WriteString(fmt.Sprintf("GROK_PYTHON=%s\n", cfg.GrokPython))
+	}
+	if cfg.ChromePath != "" {
+		b.WriteString(fmt.Sprintf("CHROME_PATH=%s\n", cfg.ChromePath))
+	}
 	b.WriteString(fmt.Sprintf("BROWSER_MCP_CLI=%s\n", cfg.BrowserMCPCommand))
 	b.WriteString(fmt.Sprintf("BROWSER_MCP_INCOGNITO=%s\n", bool01(cfg.BrowserMCPIncognito)))
 	b.WriteString(fmt.Sprintf("PROTOCOL_HTTP=%s\n", bool01(cfg.ProtocolHTTP)))
@@ -405,6 +425,9 @@ func applyMap(cfg *Config, env map[string]string) {
 			cfg.OutlookPollIntervalSec = n
 		}
 	}
+	if v, ok := env["EMAIL_PROVIDER_ROTATION"]; ok {
+		cfg.EmailProviderRotation = strings.ToLower(strings.TrimSpace(v))
+	}
 	if v, ok := env["EMAIL_INVALID_GRANT_FALLBACK"]; ok {
 		cfg.EmailInvalidGrantFallback = strings.ToLower(strings.TrimSpace(v))
 	}
@@ -428,6 +451,9 @@ func applyMap(cfg *Config, env map[string]string) {
 		if _, explicit := env["REGISTER_PROXY_PROVIDER"]; !explicit && cfg.WebshareProxyTemplate != "" {
 			cfg.RegisterProxyProvider = "webshare"
 		}
+	}
+	if v, ok := env["WEBSHARE_GATEWAYS"]; ok {
+		cfg.WebshareGateways = strings.TrimSpace(v)
 	}
 	if v, ok := env["WEBSHARE_MAX_SESSION_ATTEMPTS"]; ok {
 		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 30 {
@@ -490,6 +516,12 @@ func applyMap(cfg *Config, env map[string]string) {
 				cfg.RegisterMode = mode
 			}
 		}
+	}
+	if v, ok := env["GROK_PYTHON"]; ok {
+		cfg.GrokPython = strings.TrimSpace(v)
+	}
+	if v, ok := env["CHROME_PATH"]; ok {
+		cfg.ChromePath = strings.TrimSpace(v)
 	}
 	if v, ok := env["BROWSER_MCP_CLI"]; ok {
 		if command := strings.TrimSpace(v); command != "" {
@@ -636,6 +668,12 @@ func bool01(b bool) string {
 
 // ApplyProxyEnv sets process proxy env for outbound HTTP (tempmail etc).
 func ApplyProxyEnv(cfg Config) {
+	if cfg.GrokPython != "" {
+		_ = os.Setenv("GROK_PYTHON", cfg.GrokPython)
+	}
+	if cfg.ChromePath != "" {
+		_ = os.Setenv("CHROME_PATH", cfg.ChromePath)
+	}
 	if cfg.HTTPProxy != "" {
 		_ = os.Setenv("HTTP_PROXY", cfg.HTTPProxy)
 		_ = os.Setenv("http_proxy", cfg.HTTPProxy)

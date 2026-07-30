@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +118,105 @@ func TestCFTempRotatesAcrossConfiguredDomains(t *testing.T) {
 	// domain must actually take traffic.
 	if len(seen) != 3 {
 		t.Fatalf("rotation used %d domains: %v", len(seen), seen)
+	}
+}
+
+func TestProviderStrictlyAlternatesCFTempAndOutlook(t *testing.T) {
+	root := t.TempDir()
+	accountsPath := filepath.Join(root, "accounts.txt")
+	writeOutlookFixture(t, accountsPath, "rotate@outlook.com----mail-pass----client-id----refresh-token")
+	created := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		created++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"address": "cf" + string(rune('a'+created-1)) + "@cf.example.com",
+			"jwt":     "address-jwt",
+		})
+	}))
+	defer server.Close()
+
+	provider := New(Config{
+		Mode:                     config.EmailCFTemp,
+		CFTempAPI:                server.URL,
+		CFTempDomain:             "cf.example.com",
+		ProviderRotation:         "cf_temp_email,outlook",
+		OutlookAccountsFile:      accountsPath,
+		OutlookStateFile:         filepath.Join(root, "outlook-state.json"),
+		OutlookAliasesPerAccount: 4,
+	})
+	if err := provider.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.RequiredOutlookAllocations(5); got != 2 {
+		t.Fatalf("required Outlook allocations=%d, want 2", got)
+	}
+
+	want := []string{"cftemp", "outlook", "cftemp", "outlook"}
+	for i, kind := range want {
+		handle, err := provider.Create()
+		if err != nil {
+			t.Fatalf("allocation %d: %v", i, err)
+		}
+		if handle.Kind != kind {
+			t.Fatalf("allocation %d kind=%q, want %q", i, handle.Kind, kind)
+		}
+		provider.Release(handle)
+	}
+}
+
+func TestProviderRotationRetriesSameSourceAfterCreateFailure(t *testing.T) {
+	root := t.TempDir()
+	accountsPath := filepath.Join(root, "accounts.txt")
+	writeOutlookFixture(t, accountsPath, "rotate@outlook.com----mail-pass----client-id----refresh-token")
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"address": "cf@cf.example.com",
+			"jwt":     "address-jwt",
+		})
+	}))
+	defer server.Close()
+
+	provider := New(Config{
+		Mode:                     config.EmailCFTemp,
+		CFTempAPI:                server.URL,
+		CFTempDomain:             "cf.example.com",
+		ProviderRotation:         "cf_temp_email,outlook",
+		OutlookAccountsFile:      accountsPath,
+		OutlookStateFile:         filepath.Join(root, "outlook-state.json"),
+		OutlookAliasesPerAccount: 2,
+	})
+	if err := provider.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.Create(); err == nil {
+		t.Fatal("first Cloudflare allocation should fail")
+	}
+	cloudflare, err := provider.Create()
+	if err != nil || cloudflare.Kind != "cftemp" {
+		t.Fatalf("retry kind=%q err=%v, want cftemp", cloudflare.Kind, err)
+	}
+	outlook, err := provider.Create()
+	if err != nil || outlook.Kind != "outlook" {
+		t.Fatalf("next kind=%q err=%v, want outlook", outlook.Kind, err)
+	}
+	provider.Release(outlook)
+}
+
+func TestProviderRotationRejectsFallbackCombination(t *testing.T) {
+	provider := New(Config{
+		Mode:                 config.EmailCFTemp,
+		CFTempAPI:            "https://mail.example.test",
+		ProviderRotation:     "cf_temp_email,outlook",
+		InvalidGrantFallback: "outlook",
+	})
+	if err := provider.Validate(); err == nil || !strings.Contains(err.Error(), "不能同时启用") {
+		t.Fatalf("validation error=%v", err)
 	}
 }
 

@@ -723,7 +723,7 @@ func (e *Engine) run(ctx context.Context) error {
 		if !isBrowserRegisterMode(regMode) || regMode == "browser-mcp" {
 			return fmt.Errorf("Webshare account sessions require REGISTER_MODE=browser or camoufox")
 		}
-		e.webshare, err = proxypool.NewWebshareSessions(cfg.WebshareProxyTemplate)
+		e.webshare, err = proxypool.NewWebshareSessionsWithGateways(cfg.WebshareProxyTemplate, cfg.WebshareGateways)
 		if err != nil {
 			return err
 		}
@@ -809,19 +809,29 @@ func (e *Engine) run(ctx context.Context) error {
 		OutlookStateFile:         outlookStateFile,
 		OutlookAliasesPerAccount: cfg.OutlookAliasesPerAccount,
 		OutlookPollInterval:      time.Duration(cfg.OutlookPollIntervalSec * float64(time.Second)),
+		ProviderRotation:         cfg.EmailProviderRotation,
 		InvalidGrantFallback:     cfg.EmailInvalidGrantFallback,
 	})
 	if err := e.mail.Validate(); err != nil {
 		return fmt.Errorf("邮箱配置: %w", err)
 	}
 	if remaining, ok := e.mail.OutlookRemaining(); ok {
-		if cfg.EmailMode == config.EmailOutlook && remaining < e.opt.Target {
+		requiredByRotation := e.mail.RequiredOutlookAllocations(e.opt.Target)
+		if requiredByRotation > 0 && remaining < requiredByRotation {
+			return fmt.Errorf("邮箱源轮询至少需要 %d 个 Outlook 地址，但池中只剩 %d 个；请导入更多主邮箱或提高 OUTLOOK_ALIASES_PER_ACCOUNT", requiredByRotation, remaining)
+		}
+		if cfg.EmailMode == config.EmailOutlook && requiredByRotation == 0 && remaining < e.opt.Target {
 			return fmt.Errorf("Outlook 别名池只剩 %d 个地址，少于本次目标 %d；请导入更多主邮箱或提高 OUTLOOK_ALIASES_PER_ACCOUNT", remaining, e.opt.Target)
 		}
 		if e.mail.OutlookFallbackEnabled() && remaining < 1 {
 			return fmt.Errorf("Outlook fallback 已启用，但别名池没有可用地址")
 		}
-		if cfg.EmailMode == config.EmailOutlook && remaining < e.opt.Target+2 {
+		if requiredByRotation > 0 {
+			log.Infof("Email provider rotation=%s outlook_required=%d remaining_aliases=%d", cfg.EmailProviderRotation, requiredByRotation, remaining)
+			if remaining < requiredByRotation+2 {
+				log.Warnf("邮箱源轮询的 Outlook 地址余量较低：需要至少 %d，当前剩余 %d", requiredByRotation, remaining)
+			}
+		} else if cfg.EmailMode == config.EmailOutlook && remaining < e.opt.Target+2 {
 			log.Warnf("Outlook 别名池剩余 %d、目标 %d，几乎没有失败重试余量", remaining, e.opt.Target)
 		} else if e.mail.OutlookFallbackEnabled() {
 			log.Infof("Email invalid_grant fallback=outlook remaining_aliases=%d", remaining)

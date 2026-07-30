@@ -56,7 +56,18 @@ type Provider struct {
 	outlookErr      error
 	outlookFallback bool
 	useOutlook      bool
+	rotationMu      sync.Mutex
+	rotation        []mailboxSource
+	rotationNext    int
+	rotationErr     error
 }
+
+type mailboxSource string
+
+const (
+	mailboxSourceCFTemp  mailboxSource = "cf_temp_email"
+	mailboxSourceOutlook mailboxSource = "outlook"
+)
 
 type Config struct {
 	Mode                     config.EmailMode
@@ -73,6 +84,7 @@ type Config struct {
 	OutlookStateFile         string
 	OutlookAliasesPerAccount int
 	OutlookPollInterval      time.Duration
+	ProviderRotation         string
 	InvalidGrantFallback     string
 	HTTPClient               *http.Client
 }
@@ -95,14 +107,17 @@ func New(cfg Config) *Provider {
 	if cfg.LOLIntervalMS <= 0 {
 		cfg.LOLIntervalMS = 400
 	}
+	rotation, rotationErr := parseProviderRotation(cfg.ProviderRotation)
 	p := &Provider{
 		cfg:             cfg,
 		cfTempDomains:   SplitDomains(cfg.CFTempDomain),
 		cfTempBenched:   map[string]struct{}{},
 		outlookFallback: strings.EqualFold(strings.TrimSpace(cfg.InvalidGrantFallback), "outlook"),
 		useOutlook:      cfg.Mode == config.EmailOutlook,
+		rotation:        rotation,
+		rotationErr:     rotationErr,
 	}
-	if cfg.Mode == config.EmailOutlook || p.outlookFallback {
+	if cfg.Mode == config.EmailOutlook || p.outlookFallback || rotationContains(rotation, mailboxSourceOutlook) {
 		p.outlook, p.outlookErr = newOutlookPool(cfg)
 	}
 	return p
@@ -112,10 +127,79 @@ func New(cfg Config) *Provider {
 // mailbox API errors remain Create-time errors, while an Outlook pool must be
 // readable before a batch starts.
 func (p *Provider) Validate() error {
-	if p.cfg.Mode == config.EmailOutlook || p.outlookFallback {
+	if p.rotationErr != nil {
+		return p.rotationErr
+	}
+	if len(p.rotation) > 0 {
+		if p.outlookFallback {
+			return fmt.Errorf("EMAIL_PROVIDER_ROTATION 与 EMAIL_INVALID_GRANT_FALLBACK 不能同时启用")
+		}
+		if p.cfg.Mode != config.EmailCFTemp {
+			return fmt.Errorf("EMAIL_PROVIDER_ROTATION 包含 cf_temp_email 时需要 EMAIL_MODE=cf_temp_email")
+		}
+		if strings.TrimSpace(p.cfg.CFTempAPI) == "" && strings.TrimSpace(p.cfg.API) == "" {
+			return fmt.Errorf("EMAIL_PROVIDER_ROTATION: set CF_TEMP_EMAIL_API")
+		}
+	}
+	if p.cfg.Mode == config.EmailOutlook || p.outlookFallback || rotationContains(p.rotation, mailboxSourceOutlook) {
 		return p.outlookErr
 	}
 	return nil
+}
+
+// RequiredOutlookAllocations returns the minimum number of Outlook aliases
+// consumed by the next total allocations in an explicit provider sequence.
+func (p *Provider) RequiredOutlookAllocations(total int) int {
+	if p == nil || total <= 0 || len(p.rotation) == 0 {
+		return 0
+	}
+	required := 0
+	for i := 0; i < total; i++ {
+		if p.rotation[i%len(p.rotation)] == mailboxSourceOutlook {
+			required++
+		}
+	}
+	return required
+}
+
+func parseProviderRotation(raw string) ([]mailboxSource, error) {
+	fields := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(raw)), func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	sources := make([]mailboxSource, 0, len(fields))
+	seen := map[mailboxSource]struct{}{}
+	for _, field := range fields {
+		var source mailboxSource
+		switch field {
+		case "cf", "cloudflare", "cf_temp", "cf-temp", "cf_temp_email", "cloudflare_temp_email":
+			source = mailboxSourceCFTemp
+		case "outlook", "hotmail", "microsoft", "ms":
+			source = mailboxSourceOutlook
+		default:
+			return nil, fmt.Errorf("EMAIL_PROVIDER_ROTATION 不支持邮箱源 %q", field)
+		}
+		if _, duplicate := seen[source]; duplicate {
+			return nil, fmt.Errorf("EMAIL_PROVIDER_ROTATION 邮箱源重复: %s", source)
+		}
+		seen[source] = struct{}{}
+		sources = append(sources, source)
+	}
+	if len(sources) < 2 {
+		return nil, fmt.Errorf("EMAIL_PROVIDER_ROTATION 至少需要两个邮箱源")
+	}
+	return sources, nil
+}
+
+func rotationContains(rotation []mailboxSource, want mailboxSource) bool {
+	for _, source := range rotation {
+		if source == want {
+			return true
+		}
+	}
+	return false
 }
 
 // OutlookRemaining returns the number of not-yet-reserved aliases in the
@@ -262,13 +346,10 @@ func (p *Provider) Create() (Handle, error) {
 	useOutlook := p.useOutlook
 	p.mu.Unlock()
 	if useOutlook {
-		if p.outlookErr != nil {
-			return Handle{}, p.outlookErr
-		}
-		if p.outlook == nil {
-			return Handle{}, fmt.Errorf("Outlook 邮箱池未初始化")
-		}
-		return p.outlook.reserve(password)
+		return p.createOutlook(password)
+	}
+	if len(p.rotation) > 0 {
+		return p.createRotated(password)
 	}
 	switch p.cfg.Mode {
 	case config.EmailCustom:
@@ -304,6 +385,51 @@ func (p *Provider) Create() (Handle, error) {
 		last = fmt.Errorf("所有临时邮箱 provider 均不可用")
 	}
 	return Handle{}, last
+}
+
+// createRotated serializes source selection so successful allocations retain
+// the configured order even if callers become concurrent. A failed allocation
+// does not advance the cursor: the same source is retried until it succeeds.
+func (p *Provider) createRotated(password string) (Handle, error) {
+	p.rotationMu.Lock()
+	defer p.rotationMu.Unlock()
+	if p.rotationErr != nil {
+		return Handle{}, p.rotationErr
+	}
+	if len(p.rotation) == 0 {
+		return Handle{}, fmt.Errorf("EMAIL_PROVIDER_ROTATION 为空")
+	}
+	source := p.rotation[p.rotationNext%len(p.rotation)]
+	var (
+		h   Handle
+		err error
+	)
+	switch source {
+	case mailboxSourceCFTemp:
+		h, err = p.cfTempCreate()
+		if err == nil {
+			h.Password = password
+		}
+	case mailboxSourceOutlook:
+		h, err = p.createOutlook(password)
+	default:
+		err = fmt.Errorf("未知邮箱轮询源: %s", source)
+	}
+	if err != nil {
+		return Handle{}, err
+	}
+	p.rotationNext = (p.rotationNext + 1) % len(p.rotation)
+	return h, nil
+}
+
+func (p *Provider) createOutlook(password string) (Handle, error) {
+	if p.outlookErr != nil {
+		return Handle{}, p.outlookErr
+	}
+	if p.outlook == nil {
+		return Handle{}, fmt.Errorf("Outlook 邮箱池未初始化")
+	}
+	return p.outlook.reserve(password)
 }
 
 func (p *Provider) lolCreate() (Handle, error) {
